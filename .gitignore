@@ -1,0 +1,5 @@
+__pycache__/
+.chatbot_env/
+.env
+chroma_db/
+*.zip
