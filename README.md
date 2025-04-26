@@ -1,6 +1,6 @@
 # PadhAI Dost
 
-PadhAI Dost ("Friend of Others" in Hindi) is an AI-powered chatbot that provides intelligent assistance for students to understand and master their course materials. It utilizes Google's Gemini API and Retrieval-Augmented Generation (RAG) to deliver personalized learning support. This tool aims to provide quick, and easy solution for college students with a lot of study material to prepare for their exams.
+PadhAI Dost ("Study Buddy" in Hindi) is an AI-powered chatbot that provides intelligent assistance for students to understand and master their course materials. It utilizes Google's Gemini API and Retrieval-Augmented Generation (RAG) to deliver personalized learning support. This tool aims to provide quick, and easy solution for college students with a lot of study material to prepare for their exams.
 
 ## Project Architecture
 
