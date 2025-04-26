@@ -1,6 +1,6 @@
 # PadhAI Dost
 
-PadhAI Dost ("Friend of Others" in Hindi) is an AI-powered chatbot that provides intelligent assistance for students to understand and master their course materials. It utilizes Google's Gemini API and Retrieval-Augmented Generation (RAG) to deliver personalized learning support.
+PadhAI Dost ("Friend of Others" in Hindi) is an AI-powered chatbot that provides intelligent assistance for students to understand and master their course materials. It utilizes Google's Gemini API and Retrieval-Augmented Generation (RAG) to deliver personalized learning support. This tool aims to provide quick, and easy solution for college students with a lot of study material to prepare for their exams.
 
 ## Project Architecture
 
@@ -25,8 +25,8 @@ parai-dost/
 │── samjha_do.py          # Generates detailed document explanations
 │── pucho.py              # Creates practice questions
 │── requirements.txt      # Project dependencies
-│── .env                  # Stores API keys
-│── .chatbot_env/         # Virtual environment (ignored in version control)
+│── .env                  # Stores API key
+│── .chatbot_env/         # Virtual environment (not a part of version control)
 ```
 
 ## Installation & Setup
@@ -40,7 +40,8 @@ cd PadhAI-Dost
 ### 2. **Set Up a Virtual Environment**
 ```sh
 python -m venv .chatbot_env
-source .chatbot_env/bin/activate  # Windows: .chatbot_env\Scripts\activate
+source .chatbot_env/bin/activate 
+# Windows: .chatbot_env\Scripts\activate
 ```
 
 ### 3. **Install Dependencies**
@@ -49,6 +50,7 @@ pip install -r requirements.txt
 ```
 
 ### 4. **Set Up API Keys**
+- Go to https://aistudio.google.com/apikey and create an API Key.
 - Create a `.env` file and add your API key:
   ```
   GEMINI_API_KEY=your_google_api_key
@@ -66,8 +68,10 @@ streamlit run app.py
 - **Efficient RAG Pipeline:** Uses ChromaDB for optimized document retrieval.
 
 ## Future Enhancements
-- Support for PDF, DOCX, PPTX, PNG file formats.
-- Adaptive learning paths based on user progress.
+- Implementing custom frontend developed using TS or JS, instead of the customization-limiting Streamlit.
+- Cleaner UI, with better support for chat history. (Implementing Chat History)
+- Adaptive learning paths based on user progress. (Using Chat History implemented above)
+- Currently uses MiniLM-L6-v2 for tokenization. The system would perform more robustly with a better tokenizer (avoid API based tokenizers as they exhaust API tokens)
 
 
 ---
