@@ -14,20 +14,19 @@ import (
 	"github.com/regular-life/CouncilAI/go-backend/internal/agent"
 	"github.com/regular-life/CouncilAI/go-backend/internal/audit"
 	"github.com/regular-life/CouncilAI/go-backend/internal/cache"
-	"github.com/regular-life/CouncilAI/go-backend/internal/cache/fastcache"
 	"github.com/regular-life/CouncilAI/go-backend/internal/council"
 	"github.com/regular-life/CouncilAI/go-backend/internal/memory"
 )
 
 // Handlers encapsulates all system dependencies for the REST API endpoints.
 type Handlers struct {
-	RAGServiceURL string
-	Council       *council.Orchestrator
-	Cache         *cache.RedisCache
-	FastCache     *fastcache.SemanticCache
-	Audit         *audit.Logger
-	Router        *agent.Router
-	IngestAgent   *agent.IngestAgent
+	RAGServiceURL          string
+	Council                *council.Orchestrator
+	Cache                  *cache.RedisCache
+	SemanticCache          cache.SemanticCache
+	Audit                  *audit.Logger
+	Router                 *agent.Router
+	IngestAgent            *agent.IngestAgent
 	Memory                 *memory.ConversationStore
 	HTTPClient             *http.Client
 	SemanticCacheThreshold float32
@@ -39,7 +38,7 @@ func NewHandlers(
 	ragURL string,
 	council *council.Orchestrator,
 	redisCache *cache.RedisCache,
-	fastCache *fastcache.SemanticCache,
+	semCache cache.SemanticCache,
 	auditLogger *audit.Logger,
 	router *agent.Router,
 	ingestAgent *agent.IngestAgent,
@@ -63,7 +62,7 @@ func NewHandlers(
 		RAGServiceURL:          ragURL,
 		Council:                council,
 		Cache:                  redisCache,
-		FastCache:              fastCache,
+		SemanticCache:          semCache,
 		Audit:                  auditLogger,
 		Router:                 router,
 		IngestAgent:            ingestAgent,

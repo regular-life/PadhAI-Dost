@@ -16,7 +16,6 @@ import (
 	"github.com/regular-life/CouncilAI/go-backend/internal/audit"
 	"github.com/regular-life/CouncilAI/go-backend/internal/auth"
 	"github.com/regular-life/CouncilAI/go-backend/internal/cache"
-	"github.com/regular-life/CouncilAI/go-backend/internal/cache/fastcache"
 	"github.com/regular-life/CouncilAI/go-backend/internal/config"
 	"github.com/regular-life/CouncilAI/go-backend/internal/council"
 	"github.com/regular-life/CouncilAI/go-backend/internal/llm"
@@ -31,8 +30,11 @@ func main() {
 	// ── Core infrastructure ─────────────────────────────────────────
 	jwtManager := auth.NewJWTManager(cfg.JWTSecret, cfg.JWTExpiration)
 	redisCache := cache.NewRedisCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
-	semCache := fastcache.NewSemanticCache(5000)
-	defer semCache.Destroy()
+	semCache := cache.NewRedisSemanticCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	if err := semCache.EnsureIndex(context.Background()); err != nil {
+		log.Printf("[Warning] Failed to ensure RediSearch index: %v", err)
+	}
+	defer semCache.Close()
 	auditLogger := audit.NewLogger()
 
 	// ── Conversation memory ─────────────────────────────────────────

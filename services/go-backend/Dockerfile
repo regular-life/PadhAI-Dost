@@ -9,15 +9,13 @@ RUN go mod download
 # Copy source
 COPY . .
 
-# Build
-RUN apk add --no-cache build-base
-ENV CGO_CXXFLAGS_ALLOW="-mavx2|-mfma"
-RUN CGO_ENABLED=1 GOOS=linux go build -o /server ./cmd/server
+# Build pure Go binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /server ./cmd/server
 
 # Runtime stage
 FROM alpine:3.19
 
-RUN apk --no-cache add ca-certificates libstdc++
+RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 COPY --from=builder /server .

@@ -65,7 +65,7 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		vector, err = h.getEmbedding(r.Context(), req.Question)
 		if err == nil && len(vector) == 384 {
 			var semCachedResponse QueryResponse
-			if h.FastCache.Get(req.DocID, vector, h.SemanticCacheThreshold, &semCachedResponse) {
+			if found, _ := h.SemanticCache.Get(r.Context(), req.DocID, vector, h.SemanticCacheThreshold, &semCachedResponse); found {
 				semCachedResponse.CacheHit = true
 				semCachedResponse.Latency = time.Since(start).String()
 				h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "semantic_cache_hit")
@@ -176,7 +176,7 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Query] Cache set failed: %v", err)
 	}
 	if hasDocument && len(vector) == 384 {
-		if err := h.FastCache.Put(req.DocID, vector, response); err != nil {
+		if err := h.SemanticCache.Put(r.Context(), req.DocID, vector, response); err != nil {
 			log.Printf("[Query] Semantic cache put failed: %v", err)
 		}
 	}
