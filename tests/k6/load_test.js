@@ -24,7 +24,6 @@ export const options = {
 const BASE_URL = __ENV.API_BASE || 'http://localhost:8080';
 const DOC_ID = __ENV.DOC_ID || 'doc_wgan_123';
 
-// Sample query clusters (canonical query + semantically similar variants)
 const QUERY_VARIANTS = [
   'What is the Wasserstein distance in WGAN?',
   'Explain how Wasserstein distance improves GAN stability',
@@ -34,7 +33,6 @@ const QUERY_VARIANTS = [
 ];
 
 export function setup() {
-  // Login to acquire JWT Auth Token
   const loginRes = http.post(`${BASE_URL}/api/v1/auth/login`, JSON.stringify({
     username: 'k6_tester',
     password: 'password123',
@@ -87,5 +85,28 @@ export default function (data) {
     }
   }
 
-  sleep(0.5); // 500ms pacing between iterations
+  sleep(0.5);
+}
+
+// Industry-Standard k6 Report Generator
+export function handleSummary(data) {
+  return {
+    'stdout': textSummary(data, { indent: ' ', enableColors: true }),
+    'tests/reports/k6_load_test_summary.json': JSON.stringify(data, null, 2),
+  };
+}
+
+function textSummary(data, options) {
+  return `
+============================================================
+              k6 Load Test Execution Summary                
+============================================================
+Total Requests:     ${data.metrics.http_reqs.values.count}
+Failed Requests:    ${data.metrics.http_req_failed.values.passes} (${(data.metrics.http_req_failed.values.rate * 100).toFixed(2)}%)
+Req Duration p95:   ${data.metrics.http_req_duration.values['p(95)'].toFixed(2)} ms
+Semantic Cache Hit: ${(data.metrics.semantic_cache_hit_rate.values.rate * 100).toFixed(2)}%
+Cache Hit Latency:  ${data.metrics.semantic_cache_hit_latency_ms ? data.metrics.semantic_cache_hit_latency_ms.values['p(95)'].toFixed(2) + ' ms (p95)' : 'N/A'}
+============================================================
+Report saved to: tests/reports/k6_load_test_summary.json
+`;
 }

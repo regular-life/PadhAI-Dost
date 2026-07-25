@@ -3,6 +3,7 @@
 # Environment & secrets
 .env
 tests/*.json
+tests/reports/
 data/
 
 # Python
