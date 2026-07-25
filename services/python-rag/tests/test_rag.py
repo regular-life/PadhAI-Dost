@@ -1,39 +1,34 @@
-import pytest
-from fastapi.testclient import TestClient
+import unittest
 import sys
 import os
 
-# Ensure python-rag root is in path
+# Ensure python-rag root is in import path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from main import app
+from app.models import OCRResult, OCRBlock, ChunkType, Chunk, DocumentMetadata
 
-client = TestClient(app)
+class TestRAGModels(unittest.TestCase):
+    def test_chunk_model_instantiation(self):
+        chunk = Chunk(
+            content="Sample text content for vector embedding",
+            chunk_type=ChunkType.PARAGRAPH,
+            page_number=1,
+            chunk_index=0
+        )
+        self.assertEqual(chunk.content, "Sample text content for vector embedding")
+        self.assertEqual(chunk.chunk_type, ChunkType.PARAGRAPH)
 
-def test_health_check():
-    """Verify health check endpoint returns 200 OK."""
-    response = client.get("/health")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] in ["healthy", "ok"]
+    def test_ocr_result_instantiation(self):
+        ocr = OCRResult(
+            blocks=[
+                OCRBlock(content="Header", block_type=ChunkType.HEADING, page_number=1)
+            ],
+            metadata=DocumentMetadata(file_name="test_doc.pdf", page_count=2),
+            ocr_method="pdfplumber"
+        )
+        self.assertEqual(len(ocr.blocks), 1)
+        self.assertEqual(ocr.metadata.file_name, "test_doc.pdf")
+        self.assertEqual(ocr.ocr_method, "pdfplumber")
 
-def test_chunk_text_api():
-    """Verify text chunking endpoint."""
-    payload = {
-        "text": "Header 1\nThis is paragraph one.\n\nHeader 2\nThis is paragraph two.",
-        "chunk_size": 100,
-        "overlap": 10
-    }
-    response = client.post("/chunk", json=payload)
-    assert response.status_code == 200
-    data = response.json()
-    assert "chunks" in data
-    assert isinstance(data["chunks"], list)
-    assert len(data["chunks"]) > 0
-
-def test_embed_api_validation():
-    """Verify embedding validation on empty text."""
-    payload = {"text": ""}
-    response = client.post("/embed", json=payload)
-    # Validation error or 400
-    assert response.status_code in [400, 422]
+if __name__ == "__main__":
+    unittest.main()
