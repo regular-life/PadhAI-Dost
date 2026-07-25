@@ -108,7 +108,7 @@ QUERY_CLUSTERS = [
 class HopTimings:
     """Per-request breakdown of network hops."""
     embed_ms: float = 0.0      # /embed call latency (ms)
-    l1_cache_ms: float = 0.0   # C++ SIMD cache lookup (approximated from total)
+    l1_cache_ms: float = 0.0   # Redis Stack Semantic Cache lookup (ms)
     total_ms: float = 0.0      # End-to-end Go backend latency (ms)
     cache_hit: bool = False
     success: bool = False
