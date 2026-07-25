@@ -140,8 +140,8 @@ sequenceDiagram
     G->>G: Validate JWT → Rate Limit
 
     G->>P: Call Python RAG `/embed` to fetch a 384-dimensional query vector.
-    G->>G: Try **L1 Semantic Cache** via CGo (`fastcache.SemanticCache`). If AVX2 SIMD cosine similarity threshold > 0.85, return hit.
-    G->>R: On L1 miss, check **L2 Redis cache** (`query:<doc_id>:<sha256(question)[:16]>`).
+    G->>R: Try **Redis Stack Semantic Cache** (`RedisSemanticCache` via RediSearch VSS). If vector distance <= 0.15 (cosine similarity >= 0.85), return hit.
+    G->>R: On semantic cache miss, check **L2 exact cache** (`query:<doc_id>:<sha256(question)[:16]>`).
     R-->>G: L2 MISS
 
     alt doc_id provided
@@ -194,10 +194,10 @@ sequenceDiagram
 
 ## 6. Architectural Decision Registry (ADR)
 
-#### Decision 1: CGo + C++ SIMD L1 Cache vs. Pure Go / Redis Cache
-* **Context**: To maximize request efficiency, we need a high-performance vector similarity L1 cache. Go's garbage collector (GC) introduces unpredictable pause times under massive in-memory dictionary states.
-* **Logic**: Implementing the similarity index in C++ using Intel AVX2 SIMD instructions bypasses the Go GC entirely. Math registers evaluate 8 float products concurrently, giving **~240x latency speedups**.
-* **Trade-offs**: Harder build pipeline. *Note: We added `#if defined(__AVX2__)` fallback for ARM64 portability [RESOLVED]*.
+#### Decision 1: Redis Stack RediSearch Vector Search vs. C++ SIMD CGo Cache [SUPERSEDED]
+* **Context**: Initially, an in-process C++ AVX2 SIMD cache (`fastcache`) was used for L1 vector similarity caching.
+* **Evolution & Final Decision**: Migrated to **Redis Stack Vector Similarity Search (RediSearch)** (`redis/redis-stack-server`). This unifies L1 and L2 caching into a single distributed, persistent store, eliminates CGo toolchain dependencies (`CGO_ENABLED=0`), enables stateless Go backend horizontal scaling, and preserves cache entries across service restarts with automatic 24h TTL expiration.
+* **Trade-offs**: Requires Redis Stack Server container image instead of standard `redis:alpine`. Provides $O(\log N)$ vector search natively inside the Redis engine.
 
 #### Decision 2: Zero-Fee Local Web Search (DDG + BeautifulSoup) vs. Headless Browser
 * **Context**: Ground queries locally without API costs.

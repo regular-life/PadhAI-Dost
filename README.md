@@ -17,7 +17,7 @@ CouncilAI coordinates a multi-agent workflow:
 4. **Chairman Agent**: Synthesizes the final consensus response, including confidence scores.
 5. **Self-Reflection Agent**: Audits the result for quality and triggers a revision loop if needed.
 
-The backend infrastructure relies on a Go control plane for parallel orchestration and a Python microservice for RAG operations (OCR, chunking, and embedding). It utilizes a high-performance C++ SIMD Semantic Cache to bypass redundant LLM calls.
+The backend infrastructure relies on a Go control plane for parallel orchestration and a Python microservice for RAG operations (OCR, chunking, and embedding). It utilizes a high-performance Redis Stack Semantic Cache (RediSearch Vector Similarity Search) to bypass redundant LLM calls.
 
 ## Quick Start
 
