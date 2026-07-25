@@ -3,14 +3,13 @@ package cache
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/regular-life/CouncilAI/go-backend/internal/metrics"
@@ -50,17 +49,12 @@ func NewRedisSemanticCache(addr, password string, db int) *RedisSemanticCache {
 	}
 }
 
-// Float32ToBytes converts a []float32 slice to IEEE 754 little-endian binary bytes for RediSearch.
+// Float32ToBytes converts a []float32 slice to IEEE 754 little-endian binary bytes for RediSearch (Zero-Copy).
 func Float32ToBytes(vec []float32) []byte {
 	if len(vec) == 0 {
 		return nil
 	}
-	buf := make([]byte, len(vec)*4)
-	for i, v := range vec {
-		bits := math.Float32bits(v)
-		binary.LittleEndian.PutUint32(buf[i*4:], bits)
-	}
-	return buf
+	return unsafe.Slice((*byte)(unsafe.Pointer(&vec[0])), len(vec)*4)
 }
 
 // SanitizeTag escapes special characters in RediSearch tag query values to prevent syntax errors/injection.
