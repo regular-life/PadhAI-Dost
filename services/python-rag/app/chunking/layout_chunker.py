@@ -146,12 +146,7 @@ def chunk_document(ocr_result: OCRResult) -> list[Chunk]:
 
             i += 1
 
-    logger.info(
-        f"Chunked document into {len(chunks)} chunks "
-        f"(tables: {sum(1 for c in chunks if c.chunk_type == ChunkType.TABLE)}, "
-        f"paragraphs: {sum(1 for c in chunks if c.chunk_type == ChunkType.PARAGRAPH)})"
-    )
-
+    logger.info(f"Chunked document into {len(chunks)} chunks")
     return chunks
 
 
