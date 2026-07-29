@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 # Add the 'services/python-rag' directory to PYTHONPATH so we can import 'app'
-repo_root = Path(__file__).parent.parent.absolute()
+repo_root = Path(__file__).parent.parent.parent.absolute()
 python_rag_dir = repo_root / "services/python-rag"
 sys.path.insert(0, str(python_rag_dir))
 
