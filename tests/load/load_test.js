@@ -33,7 +33,7 @@ const QUERY_VARIANTS = [
 ];
 
 export function setup() {
-  const loginRes = http.post(`${BASE_URL}/api/v1/auth/login`, JSON.stringify({
+  const loginRes = http.post(`${BASE_URL}/api/v1/login`, JSON.stringify({
     username: 'k6_tester',
     password: 'password123',
   }), {
