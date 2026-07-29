@@ -57,6 +57,9 @@ k6 run tests/load/load_test.js
 
 # Run RAG document chunking benchmark
 python3 tests/benchmarks/bench_chunking.py
+
+# Run Redis Semantic Cache layer benchmark & comparison
+python3 tests/benchmarks/bench_caching_layer.py
 ```
 
 ## Contributing
