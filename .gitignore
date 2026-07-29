@@ -3,7 +3,8 @@
 # Environment & secrets
 .env
 tests/*.json
-tests/reports/
+tests/reports/*
+!tests/reports/.gitkeep
 data/
 
 # Python
