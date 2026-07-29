@@ -23,7 +23,7 @@ Instead of relying on a single Large Language Model (LLM), CouncilAI coordinates
 ### Goals
 1. **Consensus-driven accuracy** via multi-model evaluation.
 2. **Confidence scoring** — every answer carries a numeric confidence rating.
-3. **High Throughput** — utilizes C++ SIMD Semantic caching to reduce redundant LLM API calls.
+3. **High Throughput** — utilizes Redis Stack Vector Similarity Search (RediSearch) semantic caching to reduce redundant LLM API calls.
 4. **Extensibility** — designed for modular integration of LLMs and OCR backends.
 5. **Local Compatibility** — support for offline local vLLM models.
 
@@ -54,7 +54,7 @@ graph TB
         RouterAgent["Router Agent<br/>(intent routing)"]
         Council["Multi-Agent Council<br/>(Deliberation Pipeline)"]
         Reflect["Self-Reflection Agent<br/>(Revision Loop)"]
-        SemCache["Semantic Cache (L1)<br/>(C++ SIMD Vector)"]
+        SemCache["Semantic Cache<br/>(Redis Stack RediSearch VSS)"]
         Cache["Redis Cache (L2)"]
         AuditLog["Audit Logger<br/>(structured JSON)"]
         Metrics["Prometheus Metrics<br/>/metrics endpoint"]
@@ -78,7 +78,7 @@ graph TB
     end
 
     subgraph Infra["Infrastructure"]
-        Redis[("Redis 7<br/>(cache + rate limit)")]
+        Redis[("Redis Stack Server<br/>(VSS + cache + rate limit)")]
         Prom["Prometheus<br/>(Port 9091)"]
         Grafana["Grafana<br/>(Port 3000)"]
     end
@@ -170,8 +170,7 @@ sequenceDiagram
     G->>GM: Synthesize(question, chunks, answers, reviews)
     GM-->>G: {answer, reasoning, confidence, source}
 
-    G->>G: PUT vector locally into L1 Semantic Cache
-    G->>R: SET cache key → response (TTL: 1h)
+    G->>R: Store response in Redis Stack Semantic Cache (RediSearch VSS, TTL: 24h)
     G-->>C: 200 OK
 ```
 
@@ -208,9 +207,9 @@ sequenceDiagram
 * **Description**: User accounts are stored in-memory in `auth.go`. A server restart wipes the map, forcing users to sign up again.
 * **Solution**: (Planned) Refactor to SQLite/Redis Hash persistence.
 
-#### Gap 2: Google AVX2 SIMD Lock-in on Apple Silicon / ARM64 [RESOLVED]
-* **Description**: The AVX2 intrinsics block compilation on Apple Silicon Macs and ARM64.
-* **Solution**: Added preprocessor macro guards (`#if defined(__AVX2__)`) in `semantic_cache.cpp` to automatically fall back to standard C++ loops.
+#### Gap 2: CGo Toolchain & AVX2 Lock-in [SUPERSEDED]
+* **Description**: CGo bindings and AVX2 intrinsics created cross-compilation friction on ARM64 / Apple Silicon.
+* **Solution**: Completely removed CGo fastcache and migrated to pure Go (`CGO_ENABLED=0`) with Redis Stack RediSearch VSS and zero-copy `unsafe.Slice` float32 vector serialization.
 
 #### Gap 3: Path Traversal Vulnerabilities in Document Ingestion [RESOLVED]
 * **Description**: Python RAG `/ingest` route handles raw filenames directly when generating `doc_id`.
