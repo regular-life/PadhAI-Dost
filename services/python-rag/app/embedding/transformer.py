@@ -37,29 +37,29 @@ class TransformerEmbeddings(Embeddings):
         self.tokenizer, self.model = TransformerEmbeddings._cache[model_name]
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Embed a list of documents using mean pooling."""
+        """Embed a list of documents using batch vectorized mean pooling."""
+        if not texts:
+            return []
         if isinstance(texts, str):
             texts = [texts]
 
-        embeddings = []
-        for text in texts:
-            inputs = self.tokenizer(
-                text, return_tensors="pt", truncation=True, padding=True, max_length=512
-            )
-            with torch.no_grad():
-                outputs = self.model(**inputs)
+        # Batch tokenization (1 forward pass instead of N passes)
+        inputs = self.tokenizer(
+            texts, return_tensors="pt", truncation=True, padding=True, max_length=512
+        )
+        with torch.no_grad():
+            outputs = self.model(**inputs)
 
-            # Mean pooling
-            token_embeddings = outputs.last_hidden_state
-            attention_mask = inputs["attention_mask"].unsqueeze(-1).expand(
-                token_embeddings.size()
-            ).float()
-            sum_embeddings = torch.sum(token_embeddings * attention_mask, dim=1)
-            sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
-            embedding = (sum_embeddings / sum_mask).squeeze().tolist()
-            embeddings.append(embedding)
+        # Batch mean pooling
+        token_embeddings = outputs.last_hidden_state
+        attention_mask = inputs["attention_mask"].unsqueeze(-1).expand(
+            token_embeddings.size()
+        ).float()
+        sum_embeddings = torch.sum(token_embeddings * attention_mask, dim=1)
+        sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
+        pooled = (sum_embeddings / sum_mask).tolist()
 
-        return embeddings
+        return pooled
 
     def embed_query(self, text: str) -> list[float]:
         """Embed a single query string."""
