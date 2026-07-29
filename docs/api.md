@@ -57,7 +57,9 @@ Ask a question. If `doc_id` is provided, the answer is grounded in the document.
   ```json
   {
     "question": "What are the key concepts?",
-    "doc_id": "your_doc_id" // Optional
+    "doc_id": "your_doc_id",
+    "top_k": 5,
+    "session_id": "session_123"
   }
   ```
 * **cURL Example:**
@@ -71,10 +73,35 @@ Ask a question. If `doc_id` is provided, the answer is grounded in the document.
 ### `POST /api/v1/explain`
 Generate a document explanation targeted at a specific proficiency level (beginner, intermediate, advanced).
 * **Auth Required:** Yes
+* **Body:**
+  ```json
+  {
+    "doc_id": "your_doc_id",
+    "level": "intermediate"
+  }
+  ```
 
 ### `POST /api/v1/generate-questions`
 Generate assessment questions (MCQ or subjective) based on document context.
 * **Auth Required:** Yes
+* **Body:**
+  ```json
+  {
+    "doc_id": "your_doc_id",
+    "question_type": "mcq",
+    "count": 5
+  }
+  ```
+
+### `POST /api/v1/conversation/clear`
+Clear multi-turn conversation history for a given session.
+* **Auth Required:** Yes
+* **Body:**
+  ```json
+  {
+    "session_id": "session_123"
+  }
+  ```
 
 ---
 

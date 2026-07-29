@@ -46,14 +46,17 @@ For comprehensive API endpoints and authentication patterns, refer to the [REST 
 
 ## Testing and Benchmarks
 
-The project includes test scripts for verifying semantic cache accuracy and concurrent execution stress testing.
+CouncilAI uses a multi-tier testing architecture separating service-owned unit tests from repository-wide load and benchmark tests:
 
 ```bash
-# Run semantic cache benchmark
-python3 tests/bench_semantic_accuracy.py
+# Run all Go and Python unit tests (<1s execution)
+./scripts/run_tests_with_reports.sh
 
-# Run concurrency stress test
-python3 tests/stress_concurrency.py
+# Run k6 Virtual User (VU) load test
+k6 run tests/load/load_test.js
+
+# Run RAG document chunking benchmark
+python3 tests/benchmarks/bench_chunking.py
 ```
 
 ## Contributing
