@@ -242,15 +242,21 @@ func sanitizeJSONBackslashes(s string) string {
 	return result.String()
 }
 
-// jsonResponse helper to send JSON data.
+// jsonResponse helper to send JSON data with security headers.
 func jsonResponse(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-XSS-Protection", "1; mode=block")
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-// jsonError helper to send JSON error responses.
+// jsonError helper to send JSON error responses with security headers.
 func jsonError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-XSS-Protection", "1; mode=block")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }

@@ -51,6 +51,10 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "question is required", http.StatusBadRequest)
 		return
 	}
+	if len(req.Question) > 10000 {
+		jsonError(w, "question exceeds maximum allowed length of 10000 characters", http.StatusBadRequest)
+		return
+	}
 	if req.TopK <= 0 {
 		req.TopK = 5
 	}
