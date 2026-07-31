@@ -62,9 +62,22 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	hasDocument := req.DocID != ""
 	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.Question)))[:16]
 
-	// L1 Semantic Cache lookup.
+	// L1 Exact Match Cache lookup (1ms Redis GET, 0ms embedding overhead).
+	cacheKey := fmt.Sprintf("cache:%s:%s", req.DocID, req.Question)
+	var cachedResponse QueryResponse
+	if found, err := h.Cache.Get(r.Context(), cacheKey, &cachedResponse); err == nil && found {
+		cachedResponse.CacheHit = true
+		cachedResponse.Latency = time.Since(start).String()
+		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "redis_exact_cache_hit")
+		metrics.CacheHits.WithLabelValues("hit", "l1_exact").Inc()
+		jsonResponse(w, cachedResponse)
+		return
+	}
+	metrics.CacheHits.WithLabelValues("miss", "l1_exact").Inc()
+
+	// L2 Semantic Vector Cache lookup (RediSearch VSS).
 	var vector []float32
-	if hasDocument {
+	if hasDocument && h.SemanticCache != nil {
 		var err error
 		vector, err = h.getEmbedding(r.Context(), req.Question)
 		if err == nil && len(vector) == 384 {
@@ -73,25 +86,14 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 				semCachedResponse.CacheHit = true
 				semCachedResponse.Latency = time.Since(start).String()
 				h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "semantic_cache_hit")
-				metrics.CacheHits.WithLabelValues("hit", "l1").Inc()
+				metrics.CacheHits.WithLabelValues("hit", "l2_semantic").Inc()
 				jsonResponse(w, semCachedResponse)
 				return
 			}
-			metrics.CacheHits.WithLabelValues("miss", "l1").Inc()
+			metrics.CacheHits.WithLabelValues("miss", "l2_semantic").Inc()
 		} else if err != nil {
 			log.Printf("[Query] Failed to get embedding for semantic cache: %v", err)
 		}
-	}
-
-	// L2 Redis Cache lookup.
-	cacheKey := fmt.Sprintf("cache:%s:%s", req.DocID, req.Question)
-	var cachedResponse QueryResponse
-	if found, err := h.Cache.Get(r.Context(), cacheKey, &cachedResponse); err == nil && found {
-		cachedResponse.CacheHit = true
-		cachedResponse.Latency = time.Since(start).String()
-		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "redis_cache_hit")
-		jsonResponse(w, cachedResponse)
-		return
 	}
 
 	// Fetch conversation turns.
@@ -175,13 +177,24 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		CacheHit:     false,
 	}
 
-	// Cache result.
+	// Populate L1 Exact Match Cache (Redis GET key).
 	if err := h.Cache.Set(r.Context(), cacheKey, response); err != nil {
-		log.Printf("[Query] Cache set failed: %v", err)
+		log.Printf("[Query] L1 exact cache set failed: %v", err)
 	}
-	if hasDocument && len(vector) == 384 {
-		if err := h.SemanticCache.Put(r.Context(), req.DocID, vector, response); err != nil {
-			log.Printf("[Query] Semantic cache put failed: %v", err)
+
+	// Populate L2 Semantic Vector Cache (RediSearch VSS).
+	if hasDocument && h.SemanticCache != nil {
+		if len(vector) != 384 {
+			var err error
+			vector, err = h.getEmbedding(r.Context(), req.Question)
+			if err != nil {
+				log.Printf("[Query] Failed to get embedding for semantic cache put: %v", err)
+			}
+		}
+		if len(vector) == 384 {
+			if err := h.SemanticCache.Put(r.Context(), req.DocID, vector, response); err != nil {
+				log.Printf("[Query] L2 semantic cache put failed: %v", err)
+			}
 		}
 	}
 

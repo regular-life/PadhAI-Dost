@@ -54,8 +54,8 @@ graph TB
         RouterAgent["Router Agent<br/>(intent routing)"]
         Council["Multi-Agent Council<br/>(Deliberation Pipeline)"]
         Reflect["Self-Reflection Agent<br/>(Revision Loop)"]
-        SemCache["Semantic Cache<br/>(Redis Stack RediSearch VSS)"]
-        Cache["Redis Cache (L2)"]
+        Cache["Exact Key Cache (L1)<br/>(Redis GET 1ms)"]
+        SemCache["Semantic Vector Cache (L2)<br/>(Redis Stack RediSearch VSS)"]
         AuditLog["Audit Logger<br/>(structured JSON)"]
         Metrics["Prometheus Metrics<br/>/metrics endpoint"]
     end
@@ -86,9 +86,9 @@ graph TB
     Streamlit --> Router
     cURL --> Router
     Router --> MW --> Auth --> RL --> Handlers
-    Handlers -->|Vector Check| SemCache
-    SemCache -->|miss| Cache
-    Cache -->|miss| RouterAgent
+    Handlers -->|1. Exact Match Check (0ms embedding)| Cache
+    Cache -->|miss| SemCache
+    SemCache -->|2. Vector VSS Check (miss)| RouterAgent
     RouterAgent -->|direct mode| Gemini
     RouterAgent -->|council mode| Council
     Council -->|retrieve chunks / web search| Python
@@ -139,10 +139,10 @@ sequenceDiagram
     C->>G: POST /api/v1/query {question, doc_id}
     G->>G: Validate JWT → Rate Limit
 
-    G->>P: Call Python RAG `/embed` to fetch a 384-dimensional query vector.
-    G->>R: Try **Redis Stack Semantic Cache** (`RedisSemanticCache` via RediSearch VSS). If vector distance <= 0.15 (cosine similarity >= 0.85), return hit.
-    G->>R: On semantic cache miss, check **L2 exact cache** (`query:<doc_id>:<sha256(question)[:16]>`).
-    R-->>G: L2 MISS
+    G->>R: 1. Try L1 Exact Key Cache (`cache:<doc_id>:<question>`). If hit, return in ~1ms (0ms embedding overhead).
+    G->>P: 2. On L1 miss, call Python RAG `/embed` to fetch a 384-dimensional query vector.
+    G->>R: 3. Try L2 Semantic Vector Cache (`RedisSemanticCache` RediSearch VSS). If similarity >= 0.85, return hit.
+    R-->>G: L1 & L2 MISS
 
     alt doc_id provided
         G->>P: POST /retrieve {question, doc_id, top_k=5}
@@ -170,7 +170,7 @@ sequenceDiagram
     G->>GM: Synthesize(question, chunks, answers, reviews)
     GM-->>G: {answer, reasoning, confidence, source}
 
-    G->>R: Store response in Redis Stack Semantic Cache (RediSearch VSS, TTL: 24h)
+    G->>R: Populate L1 Exact Cache (key) & L2 Semantic Vector Cache (RediSearch VSS, TTL: 24h)
     G-->>C: 200 OK
 ```
 
