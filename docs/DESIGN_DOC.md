@@ -28,7 +28,7 @@ Instead of relying on a single Large Language Model (LLM), CouncilAI coordinates
 5. **Local Compatibility** — support for offline local vLLM models.
 
 ### Non-Goals
-* **Long-Term Multi-Turn Chat Memory**: Persistent, searchable chat history across years is out of scope for the current design phase (stateless sessions are used).
+* **Multi-Year Searchable Chat Archiving**: While short-to-medium multi-turn session memory is supported via Redis (`ConversationStore`), persistent multi-year searchable archiving across historical user accounts is out of scope.
 * **Role-Based Access Control (RBAC)**: Fine-grained permissions (Admin vs Editor) are not needed for this personal project.
 * **Multi-Modal Output Generation**: Generating charts or images in the final answer is not in scope.
 
