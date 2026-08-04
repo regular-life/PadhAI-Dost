@@ -7,6 +7,8 @@ REPORTS_DIR="${ROOT_DIR}/tests/reports"
 mkdir -p "${REPORTS_DIR}"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+START_TIME=$(date +%s%N)
+
 echo "============================================================"
 echo "          CouncilAI Unified Test & Report Runner            "
 echo "============================================================"
@@ -26,12 +28,17 @@ cd "${ROOT_DIR}"
 PYTHONPATH=services/python-rag python3 -m unittest discover services/python-rag/tests/ > "${REPORTS_DIR}/python_test_results.txt" 2>&1
 echo "  ✓ Python RAG unit tests passed cleanly (saved to: python_test_results.txt)"
 
+END_TIME=$(date +%s%N)
+ELAPSED_NS=$((END_TIME - START_TIME))
+ELAPSED_SEC=$(awk -v ns="$ELAPSED_NS" 'BEGIN { printf "%.3f", ns / 1000000000 }')
+
 # Summary Report
 SUMMARY_MD="${REPORTS_DIR}/latest_test_summary.md"
 cat <<EOF > "${SUMMARY_MD}"
 # CouncilAI Test & Benchmark Summary Report
 
 **Execution Timestamp**: ${TIMESTAMP}
+**Execution Duration**: ${ELAPSED_SEC}s
 
 ## Report Artifacts Generated
 - **Go Unit & Integration Tests**: [go_test_results.json](file://${REPORTS_DIR}/go_test_results.json)
@@ -43,6 +50,6 @@ cat <<EOF > "${SUMMARY_MD}"
 EOF
 
 echo "------------------------------------------------------------"
-echo "All unit tests completed cleanly in <1s!"
+echo "All unit tests completed cleanly in ${ELAPSED_SEC}s!"
 echo "Summary report saved to: ${SUMMARY_MD}"
 echo "============================================================"

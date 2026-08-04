@@ -16,8 +16,29 @@ import (
 type ExplainRequest struct {
 	DocID          string   `json:"doc_id"`
 	KnowledgeLevel string   `json:"knowledge_level"`
+	Level          string   `json:"level,omitempty"`
 	Depth          string   `json:"depth"`
 	FocusTopics    []string `json:"focus_topics,omitempty"`
+}
+
+// UnmarshalJSON custom unmarshals ExplainRequest to support both "knowledge_level" and "level".
+func (e *ExplainRequest) UnmarshalJSON(data []byte) error {
+	type Alias ExplainRequest
+	aux := &struct {
+		*Alias
+	}{
+		Alias: (*Alias)(e),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if e.KnowledgeLevel == "" && e.Level != "" {
+		e.KnowledgeLevel = e.Level
+	}
+	if e.Level == "" && e.KnowledgeLevel != "" {
+		e.Level = e.KnowledgeLevel
+	}
+	return nil
 }
 
 // ExplainSection holds a structured subsection of a document explanation.
@@ -46,6 +67,9 @@ func (h *Handlers) HandleExplain(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
+	}
+	if req.KnowledgeLevel == "" && req.Level != "" {
+		req.KnowledgeLevel = req.Level
 	}
 	if req.DocID == "" {
 		jsonError(w, "doc_id is required", http.StatusBadRequest)

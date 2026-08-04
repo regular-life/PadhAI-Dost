@@ -16,9 +16,30 @@ import (
 type GenerateQuestionsRequest struct {
 	DocID        string `json:"doc_id"`
 	NumQuestions int    `json:"num_questions"`
+	Count        int    `json:"count,omitempty"`
 	Difficulty   int    `json:"difficulty"`
 	QuestionType string `json:"question_type"`
 	BloomLevel   string `json:"bloom_level,omitempty"`
+}
+
+// UnmarshalJSON custom unmarshals GenerateQuestionsRequest to support both "num_questions" and "count".
+func (g *GenerateQuestionsRequest) UnmarshalJSON(data []byte) error {
+	type Alias GenerateQuestionsRequest
+	aux := &struct {
+		*Alias
+	}{
+		Alias: (*Alias)(g),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if g.NumQuestions <= 0 && g.Count > 0 {
+		g.NumQuestions = g.Count
+	}
+	if g.Count <= 0 && g.NumQuestions > 0 {
+		g.Count = g.NumQuestions
+	}
+	return nil
 }
 
 // GeneratedQuestion represents a single structured question output.
@@ -49,6 +70,9 @@ func (h *Handlers) HandleGenerateQuestions(w http.ResponseWriter, r *http.Reques
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
+	}
+	if req.NumQuestions <= 0 && req.Count > 0 {
+		req.NumQuestions = req.Count
 	}
 	if req.DocID == "" {
 		jsonError(w, "doc_id is required", http.StatusBadRequest)

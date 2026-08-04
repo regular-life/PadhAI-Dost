@@ -13,6 +13,7 @@ import json
 import math
 import random
 import os
+import struct
 import requests
 from datetime import datetime
 
@@ -49,14 +50,15 @@ def run_cache_benchmark():
     sim_ns_op = (t_sim / iterations) * 1e6
 
     # Measure Float32 byte packing throughput
+    pack_fmt = f"{len(v1)}f"
     t0 = time.perf_counter()
     for _ in range(iterations):
-        _ = len(v1) * 4  # O(1) header bounds check
+        _ = struct.pack(pack_fmt, *v1)
     t_pack = (time.perf_counter() - t0) * 1000
     pack_ns_op = (t_pack / iterations) * 1e6
 
     print(f"  ✓ Cosine Similarity Math:       {sim_ns_op:.2f} ns/op ({iterations:,} iterations)")
-    print(f"  ✓ Zero-Copy Slice Reinterpretation: {pack_ns_op:.2f} ns/op (0 allocations)")
+    print(f"  ✓ Float32 Byte Packing:         {pack_ns_op:.2f} ns/op ({iterations:,} iterations)")
 
     # ── 2. Live API Cache Benchmark (If Server Available) ──────────────────────
     print("\n[Phase 2] Live API Server Cache Evaluation")
@@ -96,6 +98,7 @@ def run_cache_benchmark():
         "vector_dim": 384,
         "micro_benchmarks": {
             "cosine_similarity_ns_op": round(sim_ns_op, 2),
+            "float32_pack_ns_op": round(pack_ns_op, 2),
             "zero_copy_pack_ns_op": round(pack_ns_op, 2),
             "iterations": iterations
         },

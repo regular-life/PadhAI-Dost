@@ -196,85 +196,154 @@ sequenceDiagram
 #### Decision 1: Redis Stack RediSearch VSS vs. In-Process C++ SIMD CGo Cache
 * **Context**: Choosing between an in-process C++ AVX2 SIMD cache (`fastcache`) vs. a distributed Redis Stack RediSearch VSS engine (`RedisSemanticCache`).
 * **Final Selection**: **Redis Stack Vector Similarity Search (RediSearch VSS)**.
-* **Pros**:
-  - **Stateless Backend Scaling**: Enables $100\%$ shared cache state across all horizontally scaled Go backend replicas.
-  - **Zero CGo Toolchain Friction**: Allows pure Go compilation (`CGO_ENABLED=0`) across x86_64, ARM64, and Alpine containers without `gcc/g++` dependencies.
-  - **Restart Persistence & TTL**: Entries survive container restarts via AOF/RDB snapshots with automatic 24-hour TTL expiration.
-  - **Zero Go Heap GC Pressure**: Employs zero-copy `unsafe.Slice` float32 byte encoding ($0\text{ bytes}$ allocated).
-  - **Vector Search Complexity**: $O(\log N)$ FLAT/HNSW index search natively inside the Redis engine.
-* **Cons**:
-  - **Network Socket Overhead**: Adds a $\sim 2.3\text{ ms}$ socket roundtrip overhead compared to process RAM lookups ($\sim 1.2\text{ ms}$).
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: Employs Go `unsafe.Slice` float32 byte casting ($0\text{ bytes}$ memory allocation). Tag filtering (`@doc_id`) restricts search scope before evaluating vector cosine distances. Native `FT.SEARCH` executes directly inside Redis engine.
+    - *Cons*: Requires `redis-stack-server` containing RediSearch 2.x modules rather than vanilla Redis Alpine.
+  - **Latency**:
+    - *Pros*: Vector similarity search completes in $\sim 1\text{--}3\text{ ms}$ inside Redis memory.
+    - *Cons*: Requires initial `/embed` HTTP roundtrip ($\sim 15\text{--}30\text{ ms}$) before vector search can execute.
+  - **Memory**:
+    - *Pros*: Vector index resides in C-heap inside Redis process, shielding Go GC from pause spikes.
+    - *Cons*: Memory scales linearly with vector count ($1.536\text{ KB}$ raw float32 data per 384-dim vector plus index overhead).
+  - **Scaling**:
+    - *Pros*: Centralized Redis VSS enables $100\%$ shared cache state across horizontally scaled, stateless Go API backend replicas.
+    - *Cons*: Cluster scaling for RediSearch requires specialized Redis Enterprise or sharding setups.
+  - **External Dependencies**:
+    - *Pros*: Pure Go compilation (`CGO_ENABLED=0`) across x86_64, ARM64, and Alpine containers without `gcc/g++` compiler locks.
+    - *Cons*: Container stack depends on `redis/redis-stack-server` image.
+  - **Maintenance**:
+    - *Pros*: Restart persistence via Redis RDB/AOF with automatic 24-hour TTL expiration.
+    - *Cons*: Requires index schema setup and version alignment across deployment environments.
 
 #### Decision 2: Tiered Cache Lookup Order (L1 Exact Match → L2 Semantic Match → L3 LLM Council)
-* **Context**: Determining the order of cache evaluation for incoming user queries.
-* **Final Selection**: **L1 Exact Key Match (`cache:<doc_id>:<question>`) → L2 Semantic Vector Match (`RedisSemanticCache` VSS) → L3 LLM Council Deliberation**.
-* **Pros**:
-  - **Instant Exact Hits ($1.0\text{ ms}$)**: Exact duplicate queries bypass Python RAG `/embed` vector calculation entirely, saving $15\text{--}30\text{ ms}$ of network roundtrips.
-  - **Resource Optimization**: Zero CPU/GPU tensor inference expended on exact query matches.
-* **Cons**:
-  - **Dual Schema Management**: Requires maintaining both string key entries and vector index entries in Redis Stack.
+* **Context**: Determining optimal cache evaluation order for incoming user queries.
+* **Final Selection**: **L1 Exact Match (`cache:<doc_id>:<question>`) → L2 Semantic Vector Match (`RedisSemanticCache` VSS) → L3 LLM Council Deliberation**.
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: Instant exact match lookups bypass vector embedding generation entirely. Multi-stage fallback allows incremental resolution.
+    - *Cons*: Dual cache schema requires populating both string key entries and vector HASH entries upon completion.
+  - **Latency**:
+    - *Pros*: L1 exact match returns in $\sim 1.0\text{ ms}$. L2 semantic match returns in $\sim 15\text{--}35\text{ ms}$, saving $2\text{--}10\text{ seconds}$ of LLM Council deliberation.
+    - *Cons*: L2 cache miss adds an embedding generation roundtrip ($\sim 15\text{--}30\text{ ms}$) prior to LLM execution.
+  - **Memory**:
+    - *Pros*: Automatic 1h (L1) and 24h (L2) TTL expirations prevent unbounded Redis RAM growth.
+    - *Cons*: Storing response JSON in both L1 string key and L2 HASH field duplicates response payload memory.
+  - **Scaling**:
+    - *Pros*: Offloads all cache state to Redis, enabling stateless Go backend horizontal scaling behind load balancers.
+    - *Cons*: High cache write throughput puts IOPS and CPU load on the primary Redis instance.
+  - **External Dependencies**:
+    - *Pros*: Monitored via standard Prometheus metrics (`metrics.CacheHits`).
+    - *Cons*: Depends on both standard Redis key-value and RediSearch capabilities.
+  - **Maintenance**:
+    - *Pros*: Simplifies cache invalidation via TTLs and standard Redis commands.
+    - *Cons*: Requires careful tuning of similarity threshold parameter ($0.85$) to avoid false positive semantic hits.
 
 #### Decision 3: PyTorch Batch Vectorized Inference in `TransformerEmbeddings`
 * **Context**: Optimizing document chunk embedding generation during multi-page ingestion.
-* **Final Selection**: **Single-Pass PyTorch Tensor Batch Inference**.
-* **Pros**:
-  - **Throughput Speedup**: Reduces $N$ separate single-chunk model forward passes down to **1 single batch forward pass** ($>15\times$ embedding speedup).
-* **Cons**:
-  - **Batch Sequence Padding**: Requires sequence padding shorter chunks to the longest chunk length in the batch.
+* **Final Selection**: **Single-Pass PyTorch Tensor Batch Inference (`sentence-transformers/all-MiniLM-L6-v2`)**.
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: Single-pass PyTorch tensor forward pass replaces $N$ individual model calls. Batch mean pooling is computed in C/PyTorch C++ backend under `torch.no_grad()`. Class-level singleton model cache prevents reloading weights.
+    - *Cons*: Sequence padding (`padding=True`) introduces minor redundant computation for short strings in a batch containing long strings.
+  - **Latency**:
+    - *Pros*: Ingestion embedding throughput speedup $>15\times$ (100 chunks embedded in $\sim 200\text{ ms}$ vs. $\sim 3.5\text{s}$).
+    - *Cons*: Single query embedding (`embed_query`) receives no batch parallelism speedup.
+  - **Memory**:
+    - *Pros*: Model weights loaded once ($\sim 90\text{ MB}$ footprint for `all-MiniLM-L6-v2`).
+    - *Cons*: Extremely large batch sizes (512+ chunks) cause temporary peak RAM spikes during transformer matrix multiplication.
+  - **Scaling**:
+    - *Pros*: Local embedding generation eliminates third-party API rate limits and token costs.
+    - *Cons*: Bound by Python GIL during tensor packaging; requires multi-worker processes for horizontal scaling.
+  - **External Dependencies**:
+    - *Pros*: Leverages standard PyTorch and HuggingFace `transformers` ecosystem.
+    - *Cons*: PyTorch dependency increases Python RAG container image size by $\sim 1\text{--}2\text{ GB}$.
+  - **Maintenance**:
+    - *Pros*: Standardized HuggingFace interface allows swapping embedding models with minimal code changes.
+    - *Cons*: Requires keeping PyTorch and HuggingFace library versions compatible.
 
-#### Decision 4: Zero-Fee Local Web Search (DDG + BeautifulSoup) vs. Headless Browser
-* **Context**: Grounding off-topic queries locally without external API costs.
-* **Final Selection**: **DuckDuckGo Search + BeautifulSoup4 HTML Parsing**.
+#### Decision 4: Zero-Fee Local Web Search (DDG + BeautifulSoup4) vs. Headless Browser
+* **Context**: Grounding off-topic general queries locally without external search API subscription fees.
+* **Final Selection**: **DuckDuckGo Search (`duckduckgo-search`) + BeautifulSoup4 Deep HTML Scraping**.
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: Deep scraping enriches search engine snippets with real page body content. Lightweight footprint ($<5\text{ MB}$ per scrape) vs. headless browser containers ($>500\text{ MB}$ RAM). Standalone Python agent isolates web I/O.
+    - *Cons*: Synchronous `requests` + `BeautifulSoup4` cannot render client-side JavaScript (React/Vue/Angular SPAs).
+  - **Latency**:
+    - *Pros*: HTML paragraph extraction completes in $<5\text{ ms}$ once webpage HTML is loaded.
+    - *Cons*: Network HTTP GET requests and search queries introduce variable latency ($\sim 500\text{ms}\text{--}2\text{s}$ total).
+  - **Memory**:
+    - *Pros*: Extremely small RAM overhead per search query ($<5\text{ MB}$).
+    - *Cons*: Concurrent scraping requests temporarily allocate memory for parsed BeautifulSoup DOM trees.
+  - **Scaling**:
+    - *Pros*: Enables real-time web search fallback for general queries without document context.
+    - *Cons*: Susceptible to IP rate limits or HTTP 429 blocking if query volume is high from a single server IP.
 * **Pros**:
-  - **Lightweight Footprint**: Eliminates $>500\text{ MB}$ Chromium browser container binaries.
-  - **Low Latency**: Parses HTML text in milliseconds without rendering DOM assets or JavaScript.
+  - **Lightweight Footprint**: Consumes $<5\text{ MB}$ RAM per scrape, eliminating $>500\text{ MB}$ Chromium/Playwright container binaries.
+  - **Low Latency HTML Parsing**: Extracts `<p>` paragraphs in $<5\text{ ms}$ after HTTP fetch.
+  - **Zero Subscription Costs**: Eliminates monthly API key requirements for web search grounding.
 * **Cons**:
-  - **Anti-Bot Susceptibility**: Vulnerable to layout changes or rate limits from search providers.
+  - **No Client-Side JS Rendering**: Cannot scrape single-page applications (React/Vue/Angular) requiring JavaScript execution.
+  - **Rate Limit & Layout Susceptibility**: Vulnerable to target website HTML changes, rate limits, or anti-bot Cloudflare checks.
+
+---
+
+### 6.1 Explicit Multi-Axis Trade-off Matrix
+
+| Technical Axis | Component | Pros | Cons |
+| :--- | :--- | :--- | :--- |
+| **Technical Design** | **Redis RediSearch VSS** | • Zero-copy `unsafe.Slice` float32 byte casting eliminates Go runtime allocations.<br/>• Tag filtering (`@doc_id`) restricts search scope prior to computing vector distance.<br/>• Native `FT.SEARCH` execution inside Redis engine. | • Requires Redis Stack module binaries (`redis-stack-server` with RediSearch 2.x) rather than vanilla Redis. |
+| | **L1/L2 Cache Tiering** | • Short-circuits $100\times$ faster on hit.<br/>• L1 exact match bypasses Python RAG `/embed` vector inference completely.<br/>• Metric labels enable granular Prometheus hit ratio tracking. | • Dual cache schema requires populating both string key entries and vector HASH entries. |
+| | **PyTorch Batch Vectorization** | • Single-pass PyTorch tensor forward pass replaces $N$ individual model calls.<br/>• Batch mean pooling is computed in C/PyTorch C++ backend.<br/>• Class-level singleton model cache prevents reloading weights. | • Sequence padding (`padding=True`) introduces minor redundant computation for short strings in a batch containing long strings. |
+| | **DuckDuckGo Search** | • Zero API key requirement and zero monthly external search subscription costs.<br/>• Deep scraping enriches brief search engine snippets with real page body content.<br/>• Standalone Python agent isolate web IO. | • Synchronous `requests` + `BeautifulSoup4` cannot render client-side JavaScript (React/Vue/Angular SPAs). |
+| **Latency** | **Redis RediSearch VSS** | • Vector similarity search completes in $\sim 1\text{--}3\text{ ms}$ inside Redis memory. | • Requires initial `/embed` HTTP roundtrip ($\sim 15\text{--}30\text{ ms}$) before vector search can execute. |
+| | **L1/L2 Cache Tiering** | • L1 exact hit: $\sim 1\text{ ms}$ response time.<br/>• L2 semantic hit: $\sim 15\text{--}35\text{ ms}$ (saving $2\text{--}10\text{ seconds}$ of LLM Council deliberation). | • L2 cache miss adds an embedding generation roundtrip ($\sim 15\text{--}30\text{ ms}$) prior to LLM execution. |
+| | **PyTorch Batch Vectorization** | • Ingestion embedding speedup $>15\times$ (100 chunks embedded in $\sim 200\text{ ms}$ vs. $\sim 3.5\text{s}$). | • Single query embedding (`embed_query`) receives no batch parallelism speedup. |
+| | **DuckDuckGo Search** | • HTML paragraph extraction completes in $<5\text{ ms}$ once webpage HTML is loaded. | • Network HTTP GET requests and search queries introduce variable latency ($\sim 500\text{ms}\text{--}2\text{s}$ total). |
+| **Memory** | **Redis RediSearch VSS** | • Vector index resides in C-heap inside Redis process, shielding Go GC from pause spikes. | • Memory scales linearly with vector count ($1.536\text{ KB}$ raw float32 data per vector + index overhead). |
+| | **L1/L2 Cache Tiering** | • Automatic 1h (L1) and 24h (L2) TTL expirations prevent unbounded Redis RAM growth. | • Storing response JSON in both L1 string key and L2 HASH field duplicates response payload memory. |
+| | **PyTorch Batch Vectorization** | • Model weights loaded once ($\sim 90\text{ MB}$ footprint for `all-MiniLM-L6-v2`). | • Extremely large batch sizes (512+ chunks) cause temporary peak RAM spikes during transformer matrix multiplication. |
+| | **DuckDuckGo Search** | • Lightweight footprint ($<5\text{ MB}$ per scrape) compared to headless browser containers ($>500\text{ MB}$ RAM). | • Concurrent scraping requests temporarily allocate memory for parsed BeautifulSoup DOM trees. |
+| **Scaling** | **Redis RediSearch VSS** | • Centralized Redis VSS enables $100\%$ shared cache state across all stateless Go API nodes. | • Cluster scaling for RediSearch requires specialized Redis Enterprise or sharding setups. |
+| | **L1/L2 Cache Tiering** | • All cache state is offloaded to Redis, allowing stateless Go backend horizontal scaling behind load balancers. | • High cache write throughput puts IOPS and CPU load on primary Redis instance. |
+| | **PyTorch Batch Vectorization** | • Offline local embedding generation eliminates third-party API rate limits and token costs. | • Bound by Python GIL during tensor packaging; requires multi-worker processes for scaling. |
+| | **DuckDuckGo Search** | • Enables real-time web search fallback for general queries without document context. | • Susceptible to IP rate limits or HTTP 429 blocking if query volume is high from single server IP. |
+| **External Dependencies & Maintenance** | **Redis RediSearch VSS** | • Pure Go compilation (`CGO_ENABLED=0`) across x86_64, ARM64, Alpine containers without CGo compilers. | • Depends on Redis Stack image (`redis/redis-stack-server`) rather than standard Redis alpine image. |
+| | **L1/L2 Cache Tiering** | • Monitored via standard Prometheus metrics (`metrics.CacheHits`). | • Requires careful tuning of similarity threshold parameter (`0.85`) to avoid false positive semantic hits. |
+| | **PyTorch Batch Vectorization** | • Standard HuggingFace `transformers` & PyTorch ecosystem. | • PyTorch dependency increases Docker image size ($\sim 1\text{--}2\text{ GB}$). |
+| | **DuckDuckGo Search** | • Minimal external package dependencies (`duckduckgo-search`, `beautifulsoup4`, `requests`). | • Third-party website HTML structure changes or anti-bot protections can cause page scraping to fail gracefully back to snippets. |
+
+---
+
+### 6.2 Trade-off Matrix Summary
+
+| Architectural Component | Technical Scope | Primary Advantage | Primary Limitation | Mitigation Strategy |
+| :--- | :--- | :--- | :--- | :--- |
+| **Redis Stack RediSearch VSS** | Vector similarity caching | Zero CGo friction; stateless Go scaling | Requires Redis Stack image | Standardized Docker Compose stack |
+| **L1/L2 Cache Tiering** | Multi-tier response caching | 1ms exact hits; bypasses LLM latency | Dual cache write payload overhead | Automatic Redis TTL expiration (1h / 24h) |
+| **PyTorch Batch Vectorization** | Embedding generation | $>15\times$ batch ingestion throughput | Padding overhead for mixed chunk lengths | Chunk length normalization during splitting |
+| **DuckDuckGo Search** | Real-time web search grounding | Zero cost; lightweight HTML parsing | No JS rendering; rate-limit prone | Fallback to search result body snippets |
+
+---
+
+### 6.3 Resolved & Engineering Gaps
 
 #### Gap 1: In-Memory User Ephemerality
-* **Description**: User accounts are stored in-memory in `auth.go`. A server restart wipes the map, forcing users to sign up again.
-* **Solution**: (Planned) Refactor to SQLite/Redis Hash persistence.
+* **Description**: User accounts were stored in-memory in `auth.go`. A server restart wiped the map, forcing user re-registration.
+* **Solution**: (Planned) Refactor user store to Redis Hash / SQLite persistence.
 
-#### Gap 2: CGo Toolchain & AVX2 Lock-in [SUPERSEDED]
+#### Gap 2: CGo Toolchain & AVX2 Lock-in [RESOLVED]
 * **Description**: CGo bindings and AVX2 intrinsics created cross-compilation friction on ARM64 / Apple Silicon.
 * **Solution**: Completely removed CGo fastcache and migrated to pure Go (`CGO_ENABLED=0`) with Redis Stack RediSearch VSS and zero-copy `unsafe.Slice` float32 vector serialization.
 
 #### Gap 3: Path Traversal Vulnerabilities in Document Ingestion [RESOLVED]
-* **Description**: Python RAG `/ingest` route handles raw filenames directly when generating `doc_id`.
-* **Solution**: Added rigorous regex scrubbers inside `ingest.py` before building `doc_id`.
+* **Description**: Python RAG `/ingest` route handled raw filenames directly when generating `doc_id`.
+* **Solution**: Added regex scrubbers inside `ingest.py` before building `doc_id`.
 
 #### Gap 4: Missing Generated `doc_id` in Go Audit Logging [RESOLVED]
 * **Description**: Go backend logged an empty string in `h.Audit.LogIngest`.
 * **Solution**: Unmarshaled the `/ingest` response in `ingest.go` to capture the generated `doc_id`.
 
-#### Gap 5: FIFO Eviction vs. True LRU Caching [RESOLVED]
-* **Description**: `SemanticCache` behaved conceptually as a FIFO cache.
-* **Solution**: Upgraded `Get` lock scopes to `std::unique_lock` on hits to safely promote accessed keys to the front of `lru_list_`.
-
-### 6.1 Engineering Gaps & Solutions
-
-**1. Go/Python Context Propagation**
-* **Gap**: Currently, context cancellation in the Go backend (e.g. client disconnect) is not fully propagated to the Python RAG service during long ingestion or retrieval tasks.
-* **Solution**: Implement context-aware HTTP requests in Go using `req.WithContext(ctx)` when calling the Python service. The Python service (using FastAPI/Starlette) should listen for client disconnects via `request.is_disconnected()`.
-* **Pros**: Prevents dangling resource locks and wasted GPU/CPU cycles on orphaned requests.
-* **Cons**: Requires rewriting Python endpoints to support async polling on `request.is_disconnected()`.
-
-**2. Database Persistence for Users and Logs**
-* **Gap**: Users are stored in an ephemeral in-memory map. Audit logs are written to flat JSON files. 
-* **Solution**: Introduce SQLite or PostgreSQL for relational persistence of users, and ship logs to a robust TSDB or structured logging aggregator like Loki.
-* **Pros**: Enables persistent accounts across restarts and scalable analytics.
-* **Cons**: Increases deployment complexity and requires database migrations.
-
-### 6.2 Conceptual Gaps & Solutions
-
-**1. Document Summary-Aware Routing**
-* **Gap**: The Router agent was previously blind to document content. It routed queries to the LLM Council even when the user asked entirely unrelated questions (e.g. "What is the capital of France?" while a highly technical PDF was attached), wasting expensive RAG retrieval and context window.
-* **Solution**: Implemented BME (Beginning-Middle-End) document sampling in the Python RAG to generate a concise representation of the document upon ingestion. The `IngestAgent` in Go generates a high-level summary, which is injected into the Router's prompt for query classification.
-* **Pros**: Massive cost savings and latency reduction by dynamically skipping RAG and falling back to 'Direct' mode for off-topic queries.
-* **Cons**: The BME summary adds latency during document ingestion (one-time cost) and may miss niche topics hidden deep in large documents.
-
-**2. Metric Evaluation of Council Consensus**
-* **Gap**: The system lacks an automated, scalable way to verify the objective accuracy of the Council's synthesized output against a known ground truth.
-* **Solution**: Implemented a canonical benchmark suite (`tests/bench_semantic_accuracy.py`) to systematically test accuracy and caching latency.
-* **Pros**: Creates an empirical feedback loop for prompt engineering and model selection.
-* **Cons**: Maintaining a high-quality, ground-truth benchmark dataset requires continuous manual curation.
+#### Gap 5: Go/Python Context Propagation
+* **Description**: Context cancellation in the Go backend (client disconnect) was not fully propagated to Python RAG service during long ingestion or retrieval tasks.
+* **Solution**: Pass Go request context via HTTP request context to cancel orphaned Python requests.
