@@ -2,9 +2,19 @@
 
 # Environment & secrets
 .env
+
+# Testing, Benchmarks & Reports
+tests/reports/
 tests/*.json
-tests/reports/*
+.benchmarks/
+.pytest_cache/
+.coverage
+htmlcov/
+*.out
+
+# Data (created at runtime)
 data/
+chroma_db/
 
 # Python
 __pycache__/
@@ -17,9 +27,6 @@ build/
 # Go
 services/go-backend/server
 services/go-backend/tmp/
-
-# Data (created at runtime)
-chroma_db/
 
 # IDE
 .vscode/
