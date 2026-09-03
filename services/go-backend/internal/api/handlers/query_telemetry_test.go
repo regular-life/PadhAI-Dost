@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
@@ -622,5 +625,1046 @@ func TestQueryTelemetry_MalformedTraceparent_GracefulFallback(t *testing.T) {
 	}
 	if tree.Root.Parent.SpanID().IsValid() {
 		t.Errorf("expected invalid ParentSpanID on malformed header fallback, got %s", tree.Root.Parent.SpanID())
+	}
+}
+
+var w3cRegex = regexp.MustCompile(`^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$`)
+
+// ── Linked Span Hierarchy & Carrier Tests ───────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Empirical Challenge 1: 5-Stage Linked Span Hierarchy & Exact Parent-Child IDs
+// ─────────────────────────────────────────────────────────────────────────────
+func TestChallengeM4_5StageLinkedSpanHierarchy_ExactParentChildIDs(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	incomingTraceID := "aa11bb22cc33dd44ee55ff6677889900"
+	incomingParentID := "1122334455667788"
+	incomingTraceparent := fmt.Sprintf("00-%s-%s-01", incomingTraceID, incomingParentID)
+
+	reqBody := `{"question": "How does CouncilAI execute 5-stage linked tracing?", "doc_id": "doc_linked"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("traceparent", incomingTraceparent)
+
+	w := httptest.NewRecorder()
+	f.handlers.HandleQuery(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	spans := f.exporter.GetSpans()
+	if len(spans) == 0 {
+		t.Fatal("expected spans to be recorded, got 0")
+	}
+
+	tree := BuildSpanTree(t, spans)
+
+	// 1. Root Server Span Verification
+	root := tree.Root
+	if root.Name != "HTTP POST /api/v1/query" {
+		t.Fatalf("expected root span name 'HTTP POST /api/v1/query', got %q", root.Name)
+	}
+	if root.SpanKind != trace.SpanKindServer {
+		t.Errorf("expected root span kind Server, got %v", root.SpanKind)
+	}
+	if root.SpanContext.TraceID().String() != incomingTraceID {
+		t.Errorf("expected root TraceID %s, got %s", incomingTraceID, root.SpanContext.TraceID())
+	}
+	if root.Parent.SpanID().String() != incomingParentID {
+		t.Errorf("expected root ParentSpanID %s, got %s", incomingParentID, root.Parent.SpanID())
+	}
+
+	rootSpanID := root.SpanContext.SpanID()
+
+	// 2. Stage 1: L1 Exact Cache Lookup
+	tree.AssertSpanCount(t, "cache.l1_lookup", 1)
+	l1Span := tree.ByName["cache.l1_lookup"][0]
+	if l1Span.SpanContext.TraceID().String() != incomingTraceID {
+		t.Errorf("L1 span TraceID %s != %s", l1Span.SpanContext.TraceID(), incomingTraceID)
+	}
+	if l1Span.Parent.SpanID() != rootSpanID {
+		t.Errorf("L1 span ParentSpanID %s != root SpanID %s", l1Span.Parent.SpanID(), rootSpanID)
+	}
+	if l1Span.SpanKind != trace.SpanKindInternal {
+		t.Errorf("L1 span kind expected Internal, got %v", l1Span.SpanKind)
+	}
+
+	// 3. Stage 2: Python /embed RPC call
+	tree.AssertSpanCount(t, "rag.embed", 1)
+	embedSpan := tree.ByName["rag.embed"][0]
+	if embedSpan.SpanContext.TraceID().String() != incomingTraceID {
+		t.Errorf("rag.embed span TraceID %s != %s", embedSpan.SpanContext.TraceID(), incomingTraceID)
+	}
+	if embedSpan.Parent.SpanID() != rootSpanID {
+		t.Errorf("rag.embed span ParentSpanID %s != root SpanID %s", embedSpan.Parent.SpanID(), rootSpanID)
+	}
+	if embedSpan.SpanKind != trace.SpanKindClient {
+		t.Errorf("rag.embed span kind expected Client, got %v", embedSpan.SpanKind)
+	}
+
+	// 4. Stage 3: L2 RediSearch VSS Lookup
+	tree.AssertSpanCount(t, "cache.l2_lookup", 1)
+	l2Span := tree.ByName["cache.l2_lookup"][0]
+	if l2Span.SpanContext.TraceID().String() != incomingTraceID {
+		t.Errorf("L2 span TraceID %s != %s", l2Span.SpanContext.TraceID(), incomingTraceID)
+	}
+	if l2Span.Parent.SpanID() != rootSpanID {
+		t.Errorf("L2 span ParentSpanID %s != root SpanID %s", l2Span.Parent.SpanID(), rootSpanID)
+	}
+	if l2Span.SpanKind != trace.SpanKindInternal {
+		t.Errorf("L2 span kind expected Internal, got %v", l2Span.SpanKind)
+	}
+
+	// 5. Stage 4: Council Candidate Fan-Out
+	tree.AssertSpanCount(t, "council.candidate_fan_out", 1)
+	fanOutSpan := tree.ByName["council.candidate_fan_out"][0]
+	if fanOutSpan.SpanContext.TraceID().String() != incomingTraceID {
+		t.Errorf("fan_out span TraceID %s != %s", fanOutSpan.SpanContext.TraceID(), incomingTraceID)
+	}
+	if fanOutSpan.Parent.SpanID() != rootSpanID {
+		t.Errorf("fan_out span ParentSpanID %s != root SpanID %s", fanOutSpan.Parent.SpanID(), rootSpanID)
+	}
+	if fanOutSpan.SpanKind != trace.SpanKindInternal {
+		t.Errorf("fan_out span kind expected Internal, got %v", fanOutSpan.SpanKind)
+	}
+
+	fanOutSpanID := fanOutSpan.SpanContext.SpanID()
+
+	// Child worker spans under Candidate Fan-Out
+	candidateSpans := tree.ByName["council.candidate_model"]
+	if len(candidateSpans) != 2 {
+		t.Fatalf("expected 2 candidate_model spans, got %d", len(candidateSpans))
+	}
+	for i, cs := range candidateSpans {
+		if cs.SpanContext.TraceID().String() != incomingTraceID {
+			t.Errorf("candidate_model[%d] TraceID %s != %s", i, cs.SpanContext.TraceID(), incomingTraceID)
+		}
+		if cs.Parent.SpanID() != fanOutSpanID {
+			t.Errorf("candidate_model[%d] ParentSpanID %s != fanOutSpanID %s", i, cs.Parent.SpanID(), fanOutSpanID)
+		}
+		if cs.SpanKind != trace.SpanKindClient {
+			t.Errorf("candidate_model[%d] kind expected Client, got %v", i, cs.SpanKind)
+		}
+	}
+
+	// 6. Stage 5: Council Chairman Deliberation
+	tree.AssertSpanCount(t, "council.chairman_deliberation", 1)
+	chairmanSpan := tree.ByName["council.chairman_deliberation"][0]
+	if chairmanSpan.SpanContext.TraceID().String() != incomingTraceID {
+		t.Errorf("chairman span TraceID %s != %s", chairmanSpan.SpanContext.TraceID(), incomingTraceID)
+	}
+	if chairmanSpan.Parent.SpanID() != rootSpanID {
+		t.Errorf("chairman span ParentSpanID %s != root SpanID %s", chairmanSpan.Parent.SpanID(), rootSpanID)
+	}
+	if chairmanSpan.SpanKind != trace.SpanKindInternal {
+		t.Errorf("chairman span kind expected Internal, got %v", chairmanSpan.SpanKind)
+	}
+
+	// Verify all spans share exact same TraceID
+	for _, s := range spans {
+		if s.SpanContext.TraceID().String() != incomingTraceID {
+			t.Errorf("span %s has mismatched TraceID: %s != %s", s.Name, s.SpanContext.TraceID(), incomingTraceID)
+		}
+		if s.StartTime.After(s.EndTime) {
+			t.Errorf("span %s StartTime %v is after EndTime %v", s.Name, s.StartTime, s.EndTime)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Empirical Challenge 2: Outgoing W3C traceparent on /embed and /retrieve
+// ─────────────────────────────────────────────────────────────────────────────
+func TestChallengeM4_OutgoingW3C_Traceparent_AllEndpoints(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	reqBody := `{"question": "Verify all outgoing W3C traceparent headers", "doc_id": "doc_w3c"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	f.handlers.HandleQuery(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+
+	f.callsMu.Lock()
+	calls := f.recordedCalls
+	f.callsMu.Unlock()
+
+	spans := f.exporter.GetSpans()
+	tree := BuildSpanTree(t, spans)
+	rootTraceID := tree.Root.SpanContext.TraceID().String()
+	embedSpan := tree.ByName["rag.embed"][0]
+	expectedEmbedSpanID := embedSpan.SpanContext.SpanID().String()
+	expectedRootSpanID := tree.Root.SpanContext.SpanID().String()
+
+	foundEmbed := false
+	foundRetrieve := false
+
+	for _, call := range calls {
+		if strings.HasSuffix(call.Path, "/embed") {
+			foundEmbed = true
+			matches := w3cRegex.FindStringSubmatch(call.Traceparent)
+			if len(matches) != 4 {
+				t.Fatalf("outgoing /embed traceparent %q does not match W3C specification", call.Traceparent)
+			}
+			if matches[1] != rootTraceID {
+				t.Errorf("/embed trace ID %s != root TraceID %s", matches[1], rootTraceID)
+			}
+			if matches[2] != expectedEmbedSpanID {
+				t.Errorf("/embed parent span ID %s != rag.embed span ID %s", matches[2], expectedEmbedSpanID)
+			}
+			if matches[3] != "01" {
+				t.Errorf("/embed trace flags expected '01' (sampled), got %q", matches[3])
+			}
+		}
+
+		if strings.HasSuffix(call.Path, "/retrieve") {
+			foundRetrieve = true
+			matches := w3cRegex.FindStringSubmatch(call.Traceparent)
+			if len(matches) != 4 {
+				t.Fatalf("outgoing /retrieve traceparent %q does not match W3C specification", call.Traceparent)
+			}
+			if matches[1] != rootTraceID {
+				t.Errorf("/retrieve trace ID %s != root TraceID %s", matches[1], rootTraceID)
+			}
+			if matches[2] != expectedRootSpanID {
+				t.Errorf("/retrieve parent span ID %s != root span ID %s", matches[2], expectedRootSpanID)
+			}
+		}
+	}
+
+	if !foundEmbed {
+		t.Error("mock RAG server received no /embed requests")
+	}
+	if !foundRetrieve {
+		t.Error("mock RAG server received no /retrieve requests")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Empirical Challenge 3: Concurrency Stress Test - Zero Cross-Contamination
+// ─────────────────────────────────────────────────────────────────────────────
+func TestChallengeM4_Adversarial_TraceConcurrency_NoContamination(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	concurrentRequests := 30
+	var wg sync.WaitGroup
+	wg.Add(concurrentRequests)
+
+	type traceResult struct {
+		reqTraceID   string
+		respTraceID  string
+		respTPHeader string
+	}
+	results := make([]traceResult, concurrentRequests)
+
+	for i := 0; i < concurrentRequests; i++ {
+		go func(idx int) {
+			defer wg.Done()
+
+			tID := fmt.Sprintf("%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+				idx, idx+1, idx+2, idx+3, idx+4, idx+5, idx+6, idx+7,
+				idx+8, idx+9, idx+10, idx+11, idx+12, idx+13, idx+14, idx+15)
+			pID := fmt.Sprintf("%02x%02x%02x%02x%02x%02x%02x%02x",
+				idx+1, idx+2, idx+3, idx+4, idx+5, idx+6, idx+7, idx+8)
+			tpHeader := fmt.Sprintf("00-%s-%s-01", tID, pID)
+
+			reqBody := fmt.Sprintf(`{"question": "Concurrency query %d", "doc_id": "doc_conc_%d"}`, idx, idx)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("traceparent", tpHeader)
+
+			w := httptest.NewRecorder()
+			f.handlers.HandleQuery(w, req)
+
+			results[idx] = traceResult{
+				reqTraceID:   tID,
+				respTraceID:  w.Header().Get("X-Trace-ID"),
+				respTPHeader: w.Header().Get("traceparent"),
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Assert each concurrent request retained its exact TraceID
+	for i, res := range results {
+		if res.respTraceID != res.reqTraceID {
+			t.Errorf("request %d: expected response X-Trace-ID %s, got %s", i, res.reqTraceID, res.respTraceID)
+		}
+		if !strings.Contains(res.respTPHeader, res.reqTraceID) {
+			t.Errorf("request %d: response traceparent %s does not contain TraceID %s", i, res.respTPHeader, res.reqTraceID)
+		}
+	}
+
+	// Group spans by TraceID and verify complete parent-child trees without cross-leakage
+	spans := f.exporter.GetSpans()
+	spansByTrace := make(map[string][]tracetest.SpanStub)
+	for _, s := range spans {
+		spansByTrace[s.SpanContext.TraceID().String()] = append(spansByTrace[s.SpanContext.TraceID().String()], s)
+	}
+
+	if len(spansByTrace) < concurrentRequests {
+		t.Errorf("expected at least %d unique traces recorded, got %d", concurrentRequests, len(spansByTrace))
+	}
+
+	for i := 0; i < concurrentRequests; i++ {
+		tID := results[i].reqTraceID
+		traceSpans := spansByTrace[tID]
+		if len(traceSpans) == 0 {
+			t.Errorf("no spans recorded for trace ID %s", tID)
+			continue
+		}
+		tree := BuildSpanTree(t, traceSpans)
+		rootID := tree.Root.SpanContext.SpanID()
+		for _, s := range traceSpans {
+			if s.SpanContext.SpanID() == rootID {
+				continue
+			}
+			if s.Name == "council.candidate_model" {
+				fanOut := tree.ByName["council.candidate_fan_out"][0]
+				if s.Parent.SpanID() != fanOut.SpanContext.SpanID() {
+					t.Errorf("trace %s: candidate_model parent %s != fanOut %s", tID, s.Parent.SpanID(), fanOut.SpanContext.SpanID())
+				}
+			} else {
+				if s.Parent.SpanID() != rootID {
+					t.Errorf("trace %s: span %s parent %s != root %s", tID, s.Name, s.Parent.SpanID(), rootID)
+				}
+			}
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Empirical Challenge 4: Adversarial Degradation & Error Status Tracing
+// ─────────────────────────────────────────────────────────────────────────────
+func TestChallengeM4_Adversarial_DegradationErrorTracing(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	// 1. Force L1 Redis cache to return error
+	f.l1Cache.SetMockGetErr(fmt.Errorf("simulated redis timeout connection lost"))
+
+	// 2. Force L2 Semantic cache to return error
+	f.l2Cache.getErr = fmt.Errorf("simulated l2 circuit open error")
+
+	reqBody := `{"question": "Degradation tracing under Redis collapse", "doc_id": "doc_degrade"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	f.handlers.HandleQuery(w, req)
+
+	// Graceful degradation: Client request MUST succeed (HTTP 200) despite Redis failures
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 with graceful degradation, got %d: %s", w.Code, w.Body.String())
+	}
+
+	spans := f.exporter.GetSpans()
+	tree := BuildSpanTree(t, spans)
+
+	// L1 span MUST record error status
+	l1Spans := tree.ByName["cache.l1_lookup"]
+	if len(l1Spans) == 0 {
+		t.Fatal("expected cache.l1_lookup span")
+	}
+	if l1Spans[0].Status.Code != codes.Error {
+		t.Errorf("expected cache.l1_lookup status Error, got %v", l1Spans[0].Status.Code)
+	}
+
+	// L2 span MUST record error status
+	l2Spans := tree.ByName["cache.l2_lookup"]
+	if len(l2Spans) == 0 {
+		t.Fatal("expected cache.l2_lookup span")
+	}
+	if l2Spans[0].Status.Code != codes.Error {
+		t.Errorf("expected cache.l2_lookup status Error, got %v", l2Spans[0].Status.Code)
+	}
+
+	// Downstream council stages MUST still execute cleanly
+	tree.AssertSpanCount(t, "council.candidate_fan_out", 1)
+	tree.AssertSpanCount(t, "council.chairman_deliberation", 1)
+
+	// Overall root span MUST be OK because query completed successfully
+	if tree.Root.Status.Code != codes.Ok {
+		t.Errorf("expected root span status OK, got %v", tree.Root.Status.Code)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Empirical Challenge 5: Performance Overhead Benchmarks (< 200µs/op)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Benchmark individual OpenTelemetry operations
+func BenchmarkChallengeM4_StartSpan_InMemory(b *testing.B) {
+	tracer, _ := telemetry.NewTestTracer()
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, span := tracer.StartSpan(ctx, "benchmark.span")
+		span.End()
+	}
+}
+
+func BenchmarkChallengeM4_StartSpan_Noop(b *testing.B) {
+	tracer := telemetry.NewNoopTracerProvider()
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, span := tracer.StartSpan(ctx, "benchmark.span")
+		span.End()
+	}
+}
+
+func BenchmarkChallengeM4_InjectHTTPHeaders(b *testing.B) {
+	tracer, _ := telemetry.NewTestTracer()
+	ctx, span := tracer.StartSpan(context.Background(), "benchmark.parent")
+	defer span.End()
+
+	req, _ := http.NewRequest("POST", "http://localhost/embed", nil)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tracer.InjectHTTPHeaders(ctx, req)
+	}
+}
+
+func BenchmarkChallengeM4_ExtractHTTPHeaders(b *testing.B) {
+	tracer, _ := telemetry.NewTestTracer()
+	req, _ := http.NewRequest("POST", "http://localhost/query", nil)
+	req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = tracer.ExtractHTTPHeaders(context.Background(), req)
+	}
+}
+
+// Benchmark the entire HandleQuery pipeline comparing:
+// 1. With InMemory Tracing
+// 2. With Noop Tracing
+// 3. Tracing Disabled (nil Tracer)
+func BenchmarkChallengeM4_QueryPipeline_OverheadDelta(b *testing.B) {
+	// Setup fast mock LLMs for benchmarking pipeline handler overhead
+	mockClient1 := &handlerMockLLMClient{
+		Name: "mock:1",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "A", Model: "mock:1"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return &llm.Response{Answer: "RANKING: A", Model: "mock:1"}, nil
+		},
+	}
+	mockClient2 := &handlerMockLLMClient{
+		Name: "mock:2",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "B", Model: "mock:2"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return &llm.Response{Answer: "RANKING: B", Model: "mock:2"}, nil
+		},
+	}
+	mockChairman := &handlerMockLLMClient{
+		Name: "mock:c",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: `{"answer":"Final","confidence":0.9}`, Model: "mock:c", Confidence: 0.9}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return &llm.Response{Answer: `{"answer":"Final","confidence":0.9}`, Model: "mock:c", Confidence: 0.9}, nil
+		},
+	}
+
+	ragServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/embed") {
+			vec := make([]float32, 384)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"embedding": vec})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/retrieve") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"chunks": []map[string]string{{"content": "Chunk"}},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ragServer.Close()
+
+	makeHandlers := func(tp telemetry.TracerProvider) *Handlers {
+		orch := council.NewOrchestrator([]llm.LLMClient{mockClient1, mockClient2}, mockChairman, 5*time.Second)
+		if tp != nil {
+			orch.SetTracer(tp)
+		}
+		cb := cache.NewCircuitBreaker("test", cache.DefaultConfig())
+		h := &Handlers{
+			RAGServiceURL:          ragServer.URL,
+			Council:                orch,
+			Cache:                  cache.NewMockRedisCache(cb),
+			SemanticCache:          &mockL2SemanticCache{},
+			HTTPClient:             &http.Client{Timeout: 5 * time.Second},
+			SemanticCacheThreshold: 0.85,
+			Tracer:                 tp,
+		}
+		return h
+	}
+
+	b.Run("WithInMemoryTracer", func(b *testing.B) {
+		tracer, _ := telemetry.NewTestTracer()
+		h := makeHandlers(tracer)
+		reqBody := `{"question": "Bench Q", "doc_id": "doc_bench"}`
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.HandleQuery(w, req)
+		}
+	})
+
+	b.Run("WithNoopTracer", func(b *testing.B) {
+		tracer := telemetry.NewNoopTracerProvider()
+		h := makeHandlers(tracer)
+		reqBody := `{"question": "Bench Q", "doc_id": "doc_bench"}`
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.HandleQuery(w, req)
+		}
+	})
+
+	b.Run("WithoutTracer", func(b *testing.B) {
+		h := makeHandlers(nil)
+		reqBody := `{"question": "Bench Q", "doc_id": "doc_bench"}`
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.HandleQuery(w, req)
+		}
+	})
+}
+
+// ── Trace Context Integrity & Latency Benchmark Tests ───────────
+
+var w3cTraceparentPattern = regexp.MustCompile(`^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$`)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 1: Malformed & Adversarial Incoming traceparent Headers Matrix
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestChallengerM4_MalformedTraceparent_ExtensiveMatrix(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	malformedCases := []struct {
+		name      string
+		headerVal string
+	}{
+		{"EmptyHeader", ""},
+		{"WhitespaceOnly", "   "},
+		{"TruncatedVersion", "0"},
+		{"InvalidVersionNonHex", "zz-1234567890abcdef1234567890abcdef-abcdef1234567890-01"},
+		{"InvalidVersionFF", "ff-1234567890abcdef1234567890abcdef-abcdef1234567890-01"},
+		{"ThreeDigitVersion", "000-1234567890abcdef1234567890abcdef-abcdef1234567890-01"},
+		{"TruncatedTraceID", "00-1234-abcdef1234567890-01"},
+		{"TooLongTraceID", "00-1234567890abcdef1234567890abcdef00-abcdef1234567890-01"},
+		{"NonHexTraceID", "00-1234567890abcdef1234567890abcdeg-abcdef1234567890-01"},
+		{"AllZeroTraceID", "00-00000000000000000000000000000000-abcdef1234567890-01"},
+		{"TruncatedParentSpanID", "00-1234567890abcdef1234567890abcdef-123-01"},
+		{"TooLongParentSpanID", "00-1234567890abcdef1234567890abcdef-abcdef123456789012-01"},
+		{"NonHexParentSpanID", "00-1234567890abcdef1234567890abcdef-abcdef123456789z-01"},
+		{"AllZeroParentSpanID", "00-1234567890abcdef1234567890abcdef-0000000000000000-01"},
+		{"MissingHyphens", "001234567890abcdef1234567890abcdefabcdef123456789001"},
+		{"ExtraDashes", "00--1234567890abcdef1234567890abcdef--abcdef1234567890--01"},
+		{"TrailingGarbage", "00-1234567890abcdef1234567890abcdef-abcdef1234567890-01-extra-payload"},
+		{"InvalidFlags", "00-1234567890abcdef1234567890abcdef-abcdef1234567890-gg"},
+		{"TruncatedFlags", "00-1234567890abcdef1234567890abcdef-abcdef1234567890-0"},
+		{"TooLongFlags", "00-1234567890abcdef1234567890abcdef-abcdef1234567890-001"},
+		{"SQLInjectionPayload", "'; DROP TABLE traces; --"},
+		{"UnicodeEmojiPayload", "00-💡💡💡💡💡💡💡💡💡💡💡💡💡💡💡💡-🚀🚀🚀🚀🚀🚀🚀🚀-01"},
+		{"HugeHeaderString", "00-" + strings.Repeat("a", 10000) + "-01"},
+		{"ControlCharacters", "00-\x00\x01\x02\r\n\t-01"},
+		{"RandomGarbageText", "not-a-traceparent-at-all"},
+	}
+
+	for _, tc := range malformedCases {
+		tc := tc
+		t.Run(tc.name+"_JSON", func(t *testing.T) {
+			reqBody := fmt.Sprintf(`{"question": "Malformed test %s", "doc_id": "doc_malformed"}`, tc.name)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			if tc.headerVal != "" {
+				req.Header.Set("traceparent", tc.headerVal)
+			}
+
+			w := httptest.NewRecorder()
+			f.handlers.HandleQuery(w, req)
+
+			// 1. Must never return 500 Internal Server Error
+			if w.Code != http.StatusOK {
+				t.Fatalf("case %s failed with unexpected HTTP status %d: %s", tc.name, w.Code, w.Body.String())
+			}
+
+			// 2. Response headers must contain valid traceparent and X-Trace-ID
+			respTraceID := w.Header().Get("X-Trace-ID")
+			if respTraceID == "" {
+				t.Fatalf("case %s missing X-Trace-ID response header", tc.name)
+			}
+			if len(respTraceID) != 32 || respTraceID == "00000000000000000000000000000000" {
+				t.Fatalf("case %s produced invalid X-Trace-ID %q", tc.name, respTraceID)
+			}
+
+			respTraceparent := w.Header().Get("traceparent")
+			if respTraceparent == "" {
+				t.Fatalf("case %s missing traceparent response header", tc.name)
+			}
+			match := w3cTraceparentPattern.FindStringSubmatch(respTraceparent)
+			if len(match) != 4 {
+				t.Fatalf("case %s traceparent response header %q invalid format", tc.name, respTraceparent)
+			}
+			if match[1] != respTraceID {
+				t.Fatalf("case %s traceparent TraceID %s != X-Trace-ID %s", tc.name, match[1], respTraceID)
+			}
+		})
+
+		t.Run(tc.name+"_SSE", func(t *testing.T) {
+			reqBody := fmt.Sprintf(`{"question": "Malformed SSE test %s", "doc_id": "doc_malformed_sse"}`, tc.name)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "text/event-stream")
+			if tc.headerVal != "" {
+				req.Header.Set("traceparent", tc.headerVal)
+			}
+
+			w := httptest.NewRecorder()
+			f.handlers.HandleQuery(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("case %s SSE failed with status %d", tc.name, w.Code)
+			}
+
+			respContentType := w.Header().Get("Content-Type")
+			if !strings.HasPrefix(respContentType, "text/event-stream") {
+				t.Fatalf("case %s SSE expected Content-Type text/event-stream, got %q", tc.name, respContentType)
+			}
+
+			respTraceID := w.Header().Get("X-Trace-ID")
+			if respTraceID == "" || len(respTraceID) != 32 || respTraceID == "00000000000000000000000000000000" {
+				t.Fatalf("case %s SSE invalid X-Trace-ID %q", tc.name, respTraceID)
+			}
+
+			// Verify SSE frames parsed cleanly without error
+			scanner := bufio.NewScanner(w.Body)
+			var hasCandidateDraft, hasPeerReview, hasFinalAnswer bool
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "event: error") {
+					t.Fatalf("case %s SSE emitted error frame on malformed traceparent: %s", tc.name, w.Body.String())
+				}
+				if strings.HasPrefix(line, "event: candidate_draft") {
+					hasCandidateDraft = true
+				}
+				if strings.HasPrefix(line, "event: peer_review") {
+					hasPeerReview = true
+				}
+				if strings.HasPrefix(line, "event: final_answer") {
+					hasFinalAnswer = true
+				}
+			}
+
+			if !hasCandidateDraft || !hasPeerReview || !hasFinalAnswer {
+				t.Errorf("case %s SSE missing expected event frames: draft=%v, review=%v, final=%v",
+					tc.name, hasCandidateDraft, hasPeerReview, hasFinalAnswer)
+			}
+		})
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 2: High Concurrency under -race with 64 Concurrent Requests
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestChallengerM4_HighConcurrency_RaceDetector_64Goroutines(t *testing.T) {
+	// Tests 64 concurrent requests generating spans simultaneously under Go race detector.
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	numWorkers := 64
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	startBarrier := make(chan struct{})
+
+	type workerResult struct {
+		index       int
+		statusCode  int
+		traceID     string
+		traceparent string
+		isSSE       bool
+		err         error
+	}
+
+	results := make([]workerResult, numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+
+			// Decide configuration per worker:
+			// 0-15: JSON with incoming traceparent
+			// 16-31: JSON without traceparent
+			// 32-47: SSE with incoming traceparent
+			// 48-63: SSE with malformed traceparent
+			isSSE := idx >= 32
+			hasIncomingTrace := (idx < 16) || (idx >= 32 && idx < 48)
+			hasMalformedTrace := idx >= 48
+
+			reqBody := fmt.Sprintf(`{"question": "Concurrency query worker %d", "doc_id": "doc_conc_%d"}`, idx, idx%4)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+
+			if isSSE {
+				req.Header.Set("Accept", "text/event-stream")
+			}
+
+			expectedTraceID := ""
+			if hasIncomingTrace {
+				expectedTraceID = fmt.Sprintf("a%031x", idx)
+				incomingParentID := fmt.Sprintf("b%015x", idx)
+				req.Header.Set("traceparent", fmt.Sprintf("00-%s-%s-01", expectedTraceID, incomingParentID))
+			} else if hasMalformedTrace {
+				req.Header.Set("traceparent", fmt.Sprintf("malformed-header-worker-%d-!", idx))
+			}
+
+			// Synchronize all goroutines to fire at the exact same instant
+			<-startBarrier
+
+			w := httptest.NewRecorder()
+			f.handlers.HandleQuery(w, req)
+
+			results[idx] = workerResult{
+				index:       idx,
+				statusCode:  w.Code,
+				traceID:     w.Header().Get("X-Trace-ID"),
+				traceparent: w.Header().Get("traceparent"),
+				isSSE:       isSSE,
+			}
+		}(i)
+	}
+
+	// Release all 64 goroutines simultaneously
+	close(startBarrier)
+	wg.Wait()
+
+	// Analyze results
+	seenTraceIDs := make(map[string]int)
+
+	for i, res := range results {
+		if res.statusCode != http.StatusOK {
+			t.Fatalf("worker %d returned HTTP %d", i, res.statusCode)
+		}
+		if res.traceID == "" || len(res.traceID) != 32 {
+			t.Fatalf("worker %d produced empty or invalid TraceID %q", i, res.traceID)
+		}
+		if res.traceparent == "" || !w3cTraceparentPattern.MatchString(res.traceparent) {
+			t.Fatalf("worker %d produced invalid traceparent header %q", i, res.traceparent)
+		}
+
+		// Verify that workers with explicit incoming traceparent received their exact TraceID
+		if (i < 16) || (i >= 32 && i < 48) {
+			expectedTraceID := fmt.Sprintf("a%031x", i)
+			if res.traceID != expectedTraceID {
+				t.Fatalf("worker %d expected incoming TraceID %s, but got %s", i, expectedTraceID, res.traceID)
+			}
+		}
+
+		seenTraceIDs[res.traceID]++
+	}
+
+	// Verify that each worker without an incoming traceparent received a unique TraceID
+	if len(seenTraceIDs) < numWorkers {
+		t.Fatalf("detected duplicate trace IDs across concurrent requests: %d unique traces out of %d requests",
+			len(seenTraceIDs), numWorkers)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 3: SSE Streaming Deliberation Trace Context & Event Frame Verification
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestChallengerM4_SSEStreaming_TraceContextIntegrity(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	incomingTraceID := "feedfacefeedfacefeedfacefeedface"
+	incomingParentID := "c001cafe12345678"
+	incomingHeader := "00-" + incomingTraceID + "-" + incomingParentID + "-01"
+
+	reqBody := `{"question": "Verify SSE trace context integrity", "doc_id": "doc_sse_trace"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("traceparent", incomingHeader)
+
+	w := httptest.NewRecorder()
+	f.handlers.HandleQuery(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 OK for SSE query, got %d", w.Code)
+	}
+
+	// 1. Response Headers Verification
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("expected Content-Type text/event-stream, got %q", ct)
+	}
+	if w.Header().Get("X-Trace-ID") != incomingTraceID {
+		t.Errorf("expected X-Trace-ID %s, got %s", incomingTraceID, w.Header().Get("X-Trace-ID"))
+	}
+	if !strings.Contains(w.Header().Get("traceparent"), incomingTraceID) {
+		t.Errorf("expected response traceparent header %q to contain incoming TraceID %s",
+			w.Header().Get("traceparent"), incomingTraceID)
+	}
+
+	// 2. SSE Frame Stream Parsing & Content Validation
+	scanner := bufio.NewScanner(w.Body)
+	var currentEvent string
+	var candidateDrafts []council.CandidateDraftPayload
+	var peerReviews []council.PeerReviewPayload
+	var finalAnswer *QueryResponse
+	var errorPayloads []map[string]interface{}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event: ") {
+			currentEvent = strings.TrimPrefix(line, "event: ")
+		} else if strings.HasPrefix(line, "data: ") {
+			dataJSON := strings.TrimPrefix(line, "data: ")
+			switch currentEvent {
+			case "candidate_draft":
+				var draft council.CandidateDraftPayload
+				if err := json.Unmarshal([]byte(dataJSON), &draft); err != nil {
+					t.Fatalf("failed to unmarshal candidate_draft data: %v", err)
+				}
+				candidateDrafts = append(candidateDrafts, draft)
+			case "peer_review":
+				var review council.PeerReviewPayload
+				if err := json.Unmarshal([]byte(dataJSON), &review); err != nil {
+					t.Fatalf("failed to unmarshal peer_review data: %v", err)
+				}
+				peerReviews = append(peerReviews, review)
+			case "final_answer":
+				var resp QueryResponse
+				if err := json.Unmarshal([]byte(dataJSON), &resp); err != nil {
+					t.Fatalf("failed to unmarshal final_answer data: %v", err)
+				}
+				finalAnswer = &resp
+			case "error":
+				var errMap map[string]interface{}
+				_ = json.Unmarshal([]byte(dataJSON), &errMap)
+				errorPayloads = append(errorPayloads, errMap)
+			}
+		}
+	}
+
+	if len(errorPayloads) > 0 {
+		t.Fatalf("unexpected error frames encountered in SSE stream: %v", errorPayloads)
+	}
+	if len(candidateDrafts) < 2 {
+		t.Fatalf("expected at least 2 candidate drafts streamed, got %d", len(candidateDrafts))
+	}
+	if len(peerReviews) < 2 {
+		t.Fatalf("expected at least 2 peer reviews streamed, got %d", len(peerReviews))
+	}
+	if finalAnswer == nil {
+		t.Fatal("expected final_answer event in SSE stream, got nil")
+	}
+	if finalAnswer.Answer == "" {
+		t.Fatal("expected non-empty final answer text in final_answer payload")
+	}
+
+	// 3. OpenTelemetry Span Tree Verification
+	spans := f.exporter.GetSpans()
+	if len(spans) == 0 {
+		t.Fatal("expected spans to be recorded for SSE deliberation, got 0")
+	}
+
+	tree := BuildSpanTree(t, spans)
+
+	// Verify all spans share incoming TraceID
+	for _, s := range spans {
+		if s.SpanContext.TraceID().String() != incomingTraceID {
+			t.Errorf("span %q TraceID %s does not match expected TraceID %s",
+				s.Name, s.SpanContext.TraceID(), incomingTraceID)
+		}
+	}
+
+	// Verify Root Attributes for SSE
+	var foundSSEAttr, foundDocAttr bool
+	for _, a := range tree.Root.Attributes {
+		if a.Key == "query.sse" && a.Value.AsBool() == true {
+			foundSSEAttr = true
+		}
+		if a.Key == "query.doc_id" && a.Value.AsString() == "doc_sse_trace" {
+			foundDocAttr = true
+		}
+	}
+	if !foundSSEAttr {
+		t.Error("expected query.sse=true attribute on root span")
+	}
+	if !foundDocAttr {
+		t.Error("expected query.doc_id=doc_sse_trace attribute on root span")
+	}
+
+	// Verify Council Stage Spans are properly linked to Root
+	rootName := "HTTP POST /api/v1/query"
+	tree.AssertParent(t, "council.candidate_fan_out", rootName)
+	tree.AssertParent(t, "council.candidate_model", "council.candidate_fan_out")
+	tree.AssertParent(t, "council.chairman_deliberation", rootName)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 4: Client Premature Disconnection during SSE Deliberation
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestChallengerM4_SSEStreaming_ClientPrematureDisconnect(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	reqBody := `{"question": "Simulate client disconnect mid-deliberation", "doc_id": "doc_disconnect"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	// Trigger cancellation immediately to simulate client network drop
+	cancel()
+
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+
+	go func() {
+		f.handlers.HandleQuery(w, req)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean exit without hanging or panicking
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleQuery hung on client premature disconnect")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 5: Outgoing Python RAG Header Propagation Verification
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestChallengerM4_OutgoingPythonRAG_TraceparentPropagation(t *testing.T) {
+	t.Parallel()
+
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	reqBody := `{"question": "Outgoing header verification", "doc_id": "doc_outgoing"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	f.handlers.HandleQuery(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+
+	f.callsMu.Lock()
+	calls := f.recordedCalls
+	f.callsMu.Unlock()
+
+	var embedFound, retrieveFound bool
+	for _, call := range calls {
+		if strings.HasSuffix(call.Path, "/embed") {
+			embedFound = true
+			if call.Traceparent == "" || !w3cTraceparentPattern.MatchString(call.Traceparent) {
+				t.Fatalf("outgoing /embed call missing valid W3C traceparent header, got %q", call.Traceparent)
+			}
+		}
+		if strings.HasSuffix(call.Path, "/retrieve") {
+			retrieveFound = true
+			if call.Traceparent == "" || !w3cTraceparentPattern.MatchString(call.Traceparent) {
+				t.Fatalf("outgoing /retrieve call missing valid W3C traceparent header, got %q", call.Traceparent)
+			}
+		}
+	}
+
+	if !embedFound {
+		t.Error("expected outgoing HTTP call to /embed")
+	}
+	if !retrieveFound {
+		t.Error("expected outgoing HTTP call to /retrieve")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 6: Fast Sub-Second Performance Guarantee
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestChallengerM4_BenchmarkLatencyOverhead(t *testing.T) {
+	f := setupTelemetryFixture(t)
+	defer f.ragServer.Close()
+
+	iterations := 20
+	start := time.Now()
+
+	for i := 0; i < iterations; i++ {
+		reqBody := fmt.Sprintf(`{"question": "Bench %d", "doc_id": "doc_perf"}`, i)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+
+		w := httptest.NewRecorder()
+		f.handlers.HandleQuery(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("iteration %d failed with status %d", i, w.Code)
+		}
+	}
+
+	elapsed := time.Since(start)
+	avgPerOp := elapsed / time.Duration(iterations)
+	t.Logf("Executed %d traced queries in %v (avg: %v/query)", iterations, elapsed, avgPerOp)
+
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("tracing overhead too high: %d iterations took %v (limit: 500ms)", iterations, elapsed)
 	}
 }

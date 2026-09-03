@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,5 +165,81 @@ func TestPostgresUserRepository_PoolAndClose(t *testing.T) {
 	// Subsequent operations on closed pool must fail
 	if err := repo.Ping(ctx); err == nil {
 		t.Error("expected ping to fail on closed repository, got nil")
+	}
+}
+
+// ── Connection & Offline Resilience Tests ────────────────────
+
+func TestEmpiricalC2_PostgresRepo_ConnectionStringGeneration(t *testing.T) {
+	t.Parallel()
+
+	// 1. Direct URL takes precedence
+	cfg1 := auth.PostgresConfig{
+		URL: "postgres://custom:pass@customhost:9999/customdb?sslmode=require",
+	}
+	if cfg1.ConnectionString() != cfg1.URL {
+		t.Errorf("expected direct URL, got %q", cfg1.ConnectionString())
+	}
+
+	// 2. Discrete fields with URL escaping
+	cfg2 := auth.PostgresConfig{
+		Host:     "db.internal",
+		Port:     "5432",
+		User:     "user@special#name",
+		Password: "p@ss:word/with?special=chars",
+		Database: "council_db",
+		SSLMode:  "disable",
+	}
+	connStr2 := cfg2.ConnectionString()
+	if !strings.Contains(connStr2, "db.internal:5432/council_db?sslmode=disable") {
+		t.Errorf("connection string missing expected host/db: %q", connStr2)
+	}
+	if !strings.Contains(connStr2, "user%40special%23name") {
+		t.Errorf("user was not URL-escaped properly in connection string: %q", connStr2)
+	}
+
+	// 3. Default fallback values
+	cfg3 := auth.PostgresConfig{}
+	connStr3 := cfg3.ConnectionString()
+	expectedDefault := "postgres://council_user:council_pass@localhost:5432/council_db?sslmode=disable"
+	if connStr3 != expectedDefault {
+		t.Errorf("expected default connection string %q, got %q", expectedDefault, connStr3)
+	}
+}
+
+func TestEmpiricalC2_PostgresRepo_OfflineConnectionTimeout(t *testing.T) {
+	t.Parallel()
+
+	cfg := auth.PostgresConfig{
+		URL: "postgres://user:pass@127.0.0.1:59999/db?sslmode=disable&connect_timeout=1",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	repo, err := auth.NewPostgresUserRepository(ctx, cfg)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		_ = repo.Close()
+		t.Fatal("expected connection error for closed port, got nil")
+	}
+
+	if elapsed > 1*time.Second {
+		t.Errorf("connection attempt took too long: %v (expected < 1s)", elapsed)
+	}
+}
+
+func TestEmpiricalC2_PostgresRepo_GracefulSkipWhenOffline(t *testing.T) {
+	t.Parallel()
+	start := time.Now()
+
+	setupPostgresRepo(t)
+
+	elapsed := time.Since(start)
+	t.Logf("PostgresRepo isolation test executed in %v", elapsed)
+	if elapsed > 500*time.Millisecond {
+		t.Logf("Warning: Postgres skip took %v", elapsed)
 	}
 }
