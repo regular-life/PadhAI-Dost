@@ -1,3 +1,4 @@
+// Package middleware provides HTTP middlewares for authentication, structured logging, and rate limiting.
 package middleware
 
 import (
@@ -10,8 +11,10 @@ import (
 
 type contextKey string
 
+// UserIDKey is the context key under which authenticated user IDs are stored.
 const UserIDKey contextKey = "user_id"
 
+// AuthMiddleware validates incoming Bearer JWT tokens and sets the UserID in the request context.
 func AuthMiddleware(jwtManager *auth.JWTManager) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +42,7 @@ func AuthMiddleware(jwtManager *auth.JWTManager) func(http.Handler) http.Handler
 	}
 }
 
+// GetUserID extracts the authenticated user ID from the request context if present.
 func GetUserID(ctx context.Context) string {
 	if uid, ok := ctx.Value(UserIDKey).(string); ok {
 		return uid

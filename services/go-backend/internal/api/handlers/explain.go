@@ -84,7 +84,7 @@ func (h *Handlers) HandleExplain(w http.ResponseWriter, r *http.Request) {
 
 	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte("explain:"+req.DocID+":"+req.KnowledgeLevel+":"+req.Depth)))[:16]
 	cacheKey := fmt.Sprintf("explain:%s:%s:%s", req.DocID, req.KnowledgeLevel, req.Depth)
-	
+
 	var cachedResponse ExplainResponse
 	if found, err := h.Cache.Get(r.Context(), cacheKey, &cachedResponse); err == nil && found {
 		cachedResponse.CacheHit = true

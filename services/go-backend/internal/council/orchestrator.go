@@ -1,3 +1,4 @@
+// Package council coordinates multi-agent consensus deliberation, peer review, and Chairman synthesis.
 package council
 
 import (

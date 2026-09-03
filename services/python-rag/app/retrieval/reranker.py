@@ -1,3 +1,5 @@
+"""Cross-encoder semantic reranker for fine-grained document relevance ranking."""
+
 import logging
 from sentence_transformers import CrossEncoder
 from app.config import get_settings

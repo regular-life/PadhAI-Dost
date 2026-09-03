@@ -1186,6 +1186,3 @@ func TestHandleQuery_NonFlusherError(t *testing.T) {
 		t.Errorf("expected 'streaming unsupported', got %q", resp["error"])
 	}
 }
-
-
-

@@ -1,3 +1,4 @@
+// Package agent provides intent classification, query routing, and document ingestion planning agents.
 package agent
 
 import (
@@ -12,9 +13,9 @@ import (
 
 // QueryPlan describes the execution strategy chosen by the router agent.
 type QueryPlan struct {
-	Strategy  string `json:"strategy"`   // "direct" | "council" | "council_deep"
-	Reasoning string `json:"reasoning"`  // Why this strategy was chosen
-	NeedsDoc  bool   `json:"needs_doc"`  // Does this query need document context?
+	Strategy  string `json:"strategy"`  // "direct" | "council" | "council_deep"
+	Reasoning string `json:"reasoning"` // Why this strategy was chosen
+	NeedsDoc  bool   `json:"needs_doc"` // Does this query need document context?
 }
 
 // Router is a lightweight agent that classifies incoming queries and
@@ -45,7 +46,7 @@ Respond ONLY with a raw JSON object and NO OTHER TEXT whatsoever. Do not include
 // Plan analyzes a question and returns an execution plan.
 func (r *Router) Plan(ctx context.Context, question string, docSummary string) (*QueryPlan, error) {
 	hasDocument := docSummary != ""
-	
+
 	var userMsg string
 	if hasDocument {
 		userMsg = fmt.Sprintf("Question: %s\nAttached Document Summary:\n%s", question, docSummary)

@@ -1,3 +1,4 @@
+// Package handlers implements HTTP request handlers for authentication, document ingestion, deliberation, explanation, and quiz generation.
 package handlers
 
 import (

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -e
+# CouncilAI Unified Test & Report Runner
+# Compliant with Google Shell Style Guide.
+
+set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORTS_DIR="${ROOT_DIR}/tests/reports"

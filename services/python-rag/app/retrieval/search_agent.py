@@ -1,3 +1,5 @@
+"""Zero-fee web search and deep scraping agent for external context injection."""
+
 import logging
 import requests
 from bs4 import BeautifulSoup
@@ -5,10 +7,20 @@ from duckduckgo_search import DDGS
 
 logger = logging.getLogger(__name__)
 
+
 class WebSearchAgent:
     """Zero-fee web search and web-scraping agent for local model context injection."""
 
     def search_and_scrape(self, query: str, max_results: int = 3) -> list[str]:
+        """Performs DuckDuckGo search and extracts deep text from target URLs.
+
+        Args:
+            query: Search query string.
+            max_results: Maximum number of search results to fetch.
+
+        Returns:
+            list[str]: Formatted source snippets with titles, URLs, and text content.
+        """
         snippets = []
         try:
             with DDGS() as ddgs:

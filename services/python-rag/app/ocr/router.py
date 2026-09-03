@@ -1,3 +1,5 @@
+"""Adaptive OCR router selecting optimal extraction engines based on document characteristics."""
+
 import io
 import logging
 from pathlib import Path
@@ -16,10 +18,23 @@ class DirectTextExtractor(OCRBackend):
     """Direct text extractor for PDFs that already possess a clean embedded text layer."""
 
     def name(self) -> str:
+        """Returns the unique identifier of the extractor.
+
+        Returns:
+            str: Identifier name 'direct_text'.
+        """
         return "direct_text"
 
     def process(self, file_bytes: bytes, filename: str) -> OCRResult:
-        """Extract embedded text directly from the PDF pages."""
+        """Extracts embedded text directly from PDF pages.
+
+        Args:
+            file_bytes: Raw binary bytes of the PDF file.
+            filename: Name of the input file.
+
+        Returns:
+            OCRResult: Extracted blocks and document metadata.
+        """
         blocks: list[OCRBlock] = []
         ext = Path(filename).suffix.lower()
         page_count = 0

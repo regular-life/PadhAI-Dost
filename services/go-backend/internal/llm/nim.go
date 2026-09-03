@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// NIMClient communicates with NVIDIA NIM microservices.
 type NIMClient struct {
 	apiKey string
 	apiURL string
@@ -17,6 +18,7 @@ type NIMClient struct {
 	client *http.Client
 }
 
+// NewNIMClient constructs a new NIMClient with the specified credentials, base URL, and model identifier.
 func NewNIMClient(apiKey, apiURL, model string, timeout time.Duration) *NIMClient {
 	return &NIMClient{
 		apiKey: apiKey,
@@ -106,6 +108,7 @@ func (c *NIMClient) GenerateChat(ctx context.Context, opts GenerateOptions) (*Re
 	}, nil
 }
 
+// ModelName returns the qualified model identifier prefixed with the nim provider name.
 func (c *NIMClient) ModelName() string {
 	return "nim:" + c.model
 }

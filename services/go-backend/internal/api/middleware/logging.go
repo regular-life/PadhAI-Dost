@@ -15,6 +15,7 @@ type statusWriter struct {
 	written    bool
 }
 
+// WriteHeader captures the HTTP status code on first invocation.
 func (w *statusWriter) WriteHeader(code int) {
 	if w.written {
 		return
@@ -24,6 +25,7 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Write records that response body bytes have been written and forwards to the underlying writer.
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if !w.written {
 		w.written = true
@@ -38,6 +40,7 @@ func (w *statusWriter) Flush() {
 	}
 }
 
+// LoggingMiddleware logs request path, method, status code, latency, and increments Prometheus metrics.
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

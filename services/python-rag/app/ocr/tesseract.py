@@ -1,3 +1,5 @@
+"""Tesseract OCR backend for scanned PDF and raster image document processing."""
+
 import io
 import logging
 from pathlib import Path
@@ -15,10 +17,23 @@ class TesseractOCR(OCRBackend):
     """OCR backend using pytesseract for general-purpose image and scanned PDF text extraction."""
 
     def name(self) -> str:
+        """Returns the unique identifier of the OCR backend.
+
+        Returns:
+            str: Identifier name 'tesseract'.
+        """
         return "tesseract"
 
     def process(self, file_bytes: bytes, filename: str) -> OCRResult:
-        """Extract text from images or scanned PDFs using Tesseract."""
+        """Extracts text from images or scanned PDFs using Tesseract OCR.
+
+        Args:
+            file_bytes: Raw binary bytes of the file.
+            filename: Input filename with extension.
+
+        Returns:
+            OCRResult: Extracted OCR text blocks and document metadata.
+        """
         import pytesseract
 
         ext = Path(filename).suffix.lower()

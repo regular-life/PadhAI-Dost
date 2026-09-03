@@ -1,3 +1,4 @@
+// Package api configures the HTTP routing topology and middleware chains for the CouncilAI gateway.
 package api
 
 import (
@@ -12,6 +13,7 @@ import (
 	"github.com/regular-life/CouncilAI/go-backend/internal/config"
 )
 
+// NewRouter constructs and mounts the chi HTTP router with middlewares and versioned endpoints.
 func NewRouter(cfg *config.Config, h *handlers.Handlers, authHandler *handlers.AuthHandler, jwtManager *auth.JWTManager) *chi.Mux {
 	r := chi.NewRouter()
 

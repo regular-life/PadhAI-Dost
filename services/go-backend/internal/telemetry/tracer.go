@@ -1,3 +1,4 @@
+// Package telemetry configures OpenTelemetry distributed tracing and W3C trace context propagation.
 package telemetry
 
 import (
@@ -305,6 +306,7 @@ func NewNoopTracerProvider() TracerProvider {
 	return &NoopTracerProvider{}
 }
 
+// StartSpan returns the context unmodified and a no-op trace.Span.
 func (n *NoopTracerProvider) StartSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -312,8 +314,10 @@ func (n *NoopTracerProvider) StartSpan(ctx context.Context, name string, opts ..
 	return ctx, trace.SpanFromContext(ctx)
 }
 
+// InjectHTTPHeaders is a no-op implementation of TracerProvider.
 func (n *NoopTracerProvider) InjectHTTPHeaders(ctx context.Context, req *http.Request) {}
 
+// ExtractHTTPHeaders returns the incoming context without modifying HTTP headers.
 func (n *NoopTracerProvider) ExtractHTTPHeaders(ctx context.Context, req *http.Request) context.Context {
 	if ctx == nil {
 		if req != nil {
@@ -324,6 +328,7 @@ func (n *NoopTracerProvider) ExtractHTTPHeaders(ctx context.Context, req *http.R
 	return ctx
 }
 
+// Shutdown is a no-op implementation of TracerProvider.
 func (n *NoopTracerProvider) Shutdown(ctx context.Context) error {
 	return nil
 }

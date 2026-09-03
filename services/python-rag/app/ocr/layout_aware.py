@@ -1,3 +1,5 @@
+"""Layout-aware OCR implementation preserving table structures and reading order."""
+
 import io
 import logging
 from pathlib import Path
@@ -12,10 +14,23 @@ class LayoutAwareOCR(OCRBackend):
     """Layout-aware OCR backend using pdfplumber for table and layout structure preservation."""
 
     def name(self) -> str:
+        """Returns the unique identifier of the OCR backend.
+
+        Returns:
+            str: Identifier name 'layout_aware'.
+        """
         return "layout_aware"
 
     def process(self, file_bytes: bytes, filename: str) -> OCRResult:
-        """Process input file using layout-aware page extraction."""
+        """Processes input file using layout-aware page extraction.
+
+        Args:
+            file_bytes: Raw binary bytes of the input document.
+            filename: Original file name with extension.
+
+        Returns:
+            OCRResult: Extracted blocks, bounding boxes, and document metadata.
+        """
         ext = Path(filename).suffix.lower()
 
         if ext != ".pdf":
@@ -57,7 +72,8 @@ class LayoutAwareOCR(OCRBackend):
 
                     # Filter out characters that fall within table bounding boxes to prevent double-extraction.
                     if table_bboxes:
-                        def not_in_table(obj):
+                        def _not_in_table(obj):
+                            """Filters out PDF character objects contained within extracted table bounding boxes."""
                             if obj.get("object_type") != "char":
                                 return True
                             x0, top, x1, bottom = obj["x0"], obj["top"], obj["x1"], obj["bottom"]
@@ -65,7 +81,7 @@ class LayoutAwareOCR(OCRBackend):
                                 if tx0 <= x0 <= tx1 and ty0 <= top <= ty1:
                                     return False
                             return True
-                        non_table_page = page.filter(not_in_table)
+                        non_table_page = page.filter(_not_in_table)
                         text = non_table_page.extract_text() or ""
                     else:
                         text = page.extract_text() or ""

@@ -10,12 +10,14 @@ import (
 	"time"
 )
 
+// GeminiClient communicates with the Google Gemini REST API.
 type GeminiClient struct {
 	apiKey string
 	model  string
 	client *http.Client
 }
 
+// NewGeminiClient constructs a new GeminiClient with the specified API key, model name, and HTTP timeout.
 func NewGeminiClient(apiKey, model string, timeout time.Duration) *GeminiClient {
 	return &GeminiClient{
 		apiKey: apiKey,
@@ -27,10 +29,10 @@ func NewGeminiClient(apiKey, model string, timeout time.Duration) *GeminiClient 
 // ── Gemini API types ────────────────────────────────────────────────
 
 type geminiRequest struct {
-	Contents          []geminiContent          `json:"contents"`
-	SystemInstruction *geminiContent           `json:"systemInstruction,omitempty"`
-	GenerationConfig  *geminiGenerationConfig  `json:"generationConfig,omitempty"`
-	Tools             []geminiTool             `json:"tools,omitempty"`
+	Contents          []geminiContent         `json:"contents"`
+	SystemInstruction *geminiContent          `json:"systemInstruction,omitempty"`
+	GenerationConfig  *geminiGenerationConfig `json:"generationConfig,omitempty"`
+	Tools             []geminiTool            `json:"tools,omitempty"`
 }
 
 type geminiTool struct {
@@ -182,6 +184,7 @@ func (c *GeminiClient) GenerateChat(ctx context.Context, opts GenerateOptions) (
 	}, nil
 }
 
+// ModelName returns the qualified model identifier prefixed with the provider name.
 func (c *GeminiClient) ModelName() string {
 	return "gemini:" + c.model
 }

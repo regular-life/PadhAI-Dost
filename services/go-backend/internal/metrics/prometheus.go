@@ -1,3 +1,4 @@
+// Package metrics defines and registers Prometheus counters, gauges, and histograms for observability.
 package metrics
 
 import (

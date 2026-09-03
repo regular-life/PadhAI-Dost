@@ -17,6 +17,7 @@ type RateLimiter struct {
 	windowSec int
 }
 
+// NewRateLimiter creates a Redis-backed sliding-window rate limiter with specified RPS and burst limits.
 func NewRateLimiter(addr, password string, db, rps, burst int) *RateLimiter {
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
@@ -31,6 +32,7 @@ func NewRateLimiter(addr, password string, db, rps, burst int) *RateLimiter {
 	}
 }
 
+// Middleware returns an HTTP middleware handler enforcing per-user rate limits.
 func (rl *RateLimiter) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

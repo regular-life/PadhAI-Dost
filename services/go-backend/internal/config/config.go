@@ -33,19 +33,19 @@ type LocalModelConfig struct {
 
 // Config represents the unified system configuration.
 type Config struct {
-	ServerPort     string
-	Debug          bool
-	RAGServiceURL  string
-	RedisAddr      string
-	RedisPassword  string
-	RedisDB        int
+	ServerPort                     string
+	Debug                          bool
+	RAGServiceURL                  string
+	RedisAddr                      string
+	RedisPassword                  string
+	RedisDB                        int
 	CircuitBreakerFailureThreshold int
 	CircuitBreakerSuccessThreshold int
 	CircuitBreakerTimeout          time.Duration
-	JWTSecret      string
-	JWTExpiration  time.Duration
-	RateLimitRPS   int
-	RateLimitBurst int
+	JWTSecret                      string
+	JWTExpiration                  time.Duration
+	RateLimitRPS                   int
+	RateLimitBurst                 int
 
 	DatabaseURL       string
 	DBHost            string
@@ -68,15 +68,15 @@ type Config struct {
 	VLLMURL    string
 	VLLMConfig LocalModelConfig
 
-	CouncilSize  int
-	CouncilSlots []ModelSlot
+	CouncilSize   int
+	CouncilSlots  []ModelSlot
 	ChairmanSlot  ModelSlot
 	RouterSlot    ModelSlot
 	IngestionSlot ModelSlot
 
-	StageTimeout   time.Duration
-	LLMTimeout     time.Duration
-	RequestTimeout time.Duration
+	StageTimeout           time.Duration
+	LLMTimeout             time.Duration
+	RequestTimeout         time.Duration
 	SemanticCacheThreshold float64
 }
 
@@ -401,19 +401,19 @@ func Load() *Config {
 	vllmCPUOffload := getEnvInt("VLLM_CPU_OFFLOAD_GB", y.VLLM.CPUOffloadGB)
 
 	return &Config{
-		ServerPort:     port,
-		Debug:          debug,
-		RAGServiceURL:  ragURL,
-		RedisAddr:      redisAddr,
-		RedisPassword:  redisPwd,
-		RedisDB:        redisDB,
+		ServerPort:                     port,
+		Debug:                          debug,
+		RAGServiceURL:                  ragURL,
+		RedisAddr:                      redisAddr,
+		RedisPassword:                  redisPwd,
+		RedisDB:                        redisDB,
 		CircuitBreakerFailureThreshold: cbFailureThresh,
 		CircuitBreakerSuccessThreshold: cbSuccessThresh,
 		CircuitBreakerTimeout:          cbTimeout,
-		JWTSecret:      jwtSecret,
-		JWTExpiration:  jwtExp,
-		RateLimitRPS:   rps,
-		RateLimitBurst: burst,
+		JWTSecret:                      jwtSecret,
+		JWTExpiration:                  jwtExp,
+		RateLimitRPS:                   rps,
+		RateLimitBurst:                 burst,
 
 		DatabaseURL:       dbURL,
 		DBHost:            dbHost,
@@ -454,9 +454,9 @@ func Load() *Config {
 		RouterSlot:    ModelSlot{Provider: routerProvider, Model: routerModel},
 		IngestionSlot: ModelSlot{Provider: ingestionProvider, Model: ingestionModel},
 
-		StageTimeout:   stageTimeout,
-		LLMTimeout:     llmTimeout,
-		RequestTimeout: reqTimeout,
+		StageTimeout:           stageTimeout,
+		LLMTimeout:             llmTimeout,
+		RequestTimeout:         reqTimeout,
 		SemanticCacheThreshold: cacheThresh,
 	}
 }

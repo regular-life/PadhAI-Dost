@@ -1,3 +1,4 @@
+// Package memory manages multi-turn conversation session history backed by Redis.
 package memory
 
 import (
@@ -12,16 +13,16 @@ import (
 
 // Turn represents a single message in a conversation.
 type Turn struct {
-	Role      string    `json:"role"`      // "user" | "assistant"
+	Role      string    `json:"role"` // "user" | "assistant"
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
 // ConversationStore manages multi-turn conversation history in Redis.
 type ConversationStore struct {
-	client     *redis.Client
-	maxTurns   int
-	ttl        time.Duration
+	client   *redis.Client
+	maxTurns int
+	ttl      time.Duration
 }
 
 // NewConversationStore creates a new conversation store backed by Redis.

@@ -1,3 +1,4 @@
+// Package cache provides exact key caching, vector similarity search, and circuit-breaker resilience wrappers.
 package cache
 
 import (
@@ -18,6 +19,7 @@ const (
 	StateOpen
 )
 
+// String returns the human-readable string representation of the circuit breaker State.
 func (s State) String() string {
 	switch s {
 	case StateClosed:
@@ -52,11 +54,11 @@ type CircuitBreaker interface {
 
 // Config specifies the operational parameters for the circuit breaker.
 type Config struct {
-	FailureThreshold int           // Consecutive failures to transition Closed -> Open (default: 3)
-	SuccessThreshold int           // Consecutive successes in Half-Open to transition -> Closed (default: 2)
-	Timeout          time.Duration // Cooldown duration before transitioning Open -> Half-Open (default: 10s)
-	ResetTimeout     time.Duration // Alias for Timeout if specified
-	HalfOpenMaxCalls int           // Maximum concurrent probe calls in Half-Open state (default: 1)
+	FailureThreshold int              // Consecutive failures to transition Closed -> Open (default: 3)
+	SuccessThreshold int              // Consecutive successes in Half-Open to transition -> Closed (default: 2)
+	Timeout          time.Duration    // Cooldown duration before transitioning Open -> Half-Open (default: 10s)
+	ResetTimeout     time.Duration    // Alias for Timeout if specified
+	HalfOpenMaxCalls int              // Maximum concurrent probe calls in Half-Open state (default: 1)
 	NowFunc          func() time.Time // Clock override for deterministic unit testing
 }
 
@@ -125,10 +127,10 @@ func NewCircuitBreaker(args ...any) *Breaker {
 	}
 
 	b := &Breaker{
-		name:            name,
-		config:          cfg,
-		state:           StateClosed,
-		nowFunc:         cfg.NowFunc,
+		name:    name,
+		config:  cfg,
+		state:   StateClosed,
+		nowFunc: cfg.NowFunc,
 	}
 	b.lastStateChange = b.now()
 	return b

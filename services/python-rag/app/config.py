@@ -1,5 +1,7 @@
-import os
+"""Configuration loader and settings models for the Python RAG service."""
+
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 from pydantic_settings import BaseSettings
@@ -10,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
     """Configuration settings for the RAG service."""
+
     chroma_db_path: str = "/data/chroma_db"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -20,7 +23,11 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def get_settings() -> Settings:
-    """Load configuration from config.yaml with environment variable overrides."""
+    """Loads configuration from config.yaml with environment variable overrides.
+
+    Returns:
+        Settings: Validated RAG application settings instance.
+    """
     yaml_data = {}
     config_paths = ["/app/config.yaml", "config.yaml", "../../config.yaml", "../../../config.yaml"]
     

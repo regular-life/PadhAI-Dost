@@ -170,12 +170,12 @@ func TestEmpirical_AcceptHeaderMatrix(t *testing.T) {
 	h := setupTestHandlersWithCouncil(t, nil, nil)
 
 	testCases := []struct {
-		name            string
-		acceptHeaders   []string
-		expectSSE       bool
-		expectedCT      string
-		expectBodyHas   string
-		expectBodyNot   string
+		name          string
+		acceptHeaders []string
+		expectSSE     bool
+		expectedCT    string
+		expectBodyHas string
+		expectBodyNot string
 	}{
 		{
 			name:          "Exact text/event-stream",
@@ -537,8 +537,8 @@ func TestEmpirical_HighConcurrency_MixedTraffic(t *testing.T) {
 
 	const totalRequests = 50
 	var (
-		wg         sync.WaitGroup
-		successSSE int64
+		wg          sync.WaitGroup
+		successSSE  int64
 		successJSON int64
 	)
 
@@ -683,4 +683,3 @@ func TestEmpirical_SemanticCacheHit_SSEStreaming(t *testing.T) {
 		t.Errorf("expected CacheHit true, got false")
 	}
 }
-

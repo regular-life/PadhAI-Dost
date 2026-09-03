@@ -1,5 +1,7 @@
-import logging
+"""ChromaDB vector store adapter for persisting and retrieving document embeddings."""
+
 import hashlib
+import logging
 from typing import Optional
 
 from langchain_community.vectorstores import Chroma
@@ -15,12 +17,25 @@ class ChromaStore:
     """Vector store manager for ChromaDB collection operations."""
 
     def __init__(self, persist_directory: Optional[str] = None):
+        """Initializes ChromaStore with directory path and embedding model.
+
+        Args:
+            persist_directory: Optional filesystem path for ChromaDB storage.
+        """
         settings = get_settings()
         self.persist_directory = persist_directory or settings.chroma_db_path
         self.embeddings = TransformerEmbeddings(settings.embedding_model)
 
     def ingest(self, chunks: list[Chunk], doc_id: str) -> int:
-        """Store document chunks in ChromaDB with metadata."""
+        """Stores document chunks in ChromaDB with metadata.
+
+        Args:
+            chunks: List of semantic text chunks to embed and store.
+            doc_id: Unique document identifier.
+
+        Returns:
+            int: Number of chunks successfully persisted.
+        """
         if not chunks:
             logger.warning("No chunks to ingest")
             return 0

@@ -54,8 +54,8 @@ func main() {
 	// ── Conversation memory ─────────────────────────────────────────
 	convStore := memory.NewConversationStore(
 		cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB,
-		10,             // max turns per session
-		24*time.Hour,   // TTL
+		10,           // max turns per session
+		24*time.Hour, // TTL
 	)
 	defer convStore.Close()
 

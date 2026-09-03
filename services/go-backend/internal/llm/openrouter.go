@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// OpenRouterClient communicates with the OpenRouter API (OpenAI-compatible chat completion endpoints).
 type OpenRouterClient struct {
 	apiKey string
 	apiURL string
@@ -17,6 +18,7 @@ type OpenRouterClient struct {
 	client *http.Client
 }
 
+// NewOpenRouterClient constructs a new OpenRouterClient with the specified credentials, base URL, and model.
 func NewOpenRouterClient(apiKey, apiURL, model string, timeout time.Duration) *OpenRouterClient {
 	return &OpenRouterClient{
 		apiKey: apiKey,
@@ -141,6 +143,7 @@ func (c *OpenRouterClient) GenerateChat(ctx context.Context, opts GenerateOption
 	}, nil
 }
 
+// ModelName returns the configured OpenRouter model identifier.
 func (c *OpenRouterClient) ModelName() string {
 	return c.model
 }
