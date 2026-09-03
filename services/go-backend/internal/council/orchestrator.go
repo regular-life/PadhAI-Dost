@@ -280,108 +280,96 @@ func (o *Orchestrator) Query(ctx context.Context, question string, chunks []stri
 }
 
 // QueryStream runs the full council deliberation pipeline with progressive event streaming.
-func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks []string, customPrompt string, skipChairman bool, strategy string, history []ConversationTurn, events chan<- StreamEvent) (*CouncilResult, error) {
+func (o *Orchestrator) mockQueryStream(ctx context.Context, question, strategy string, start time.Time, events chan<- StreamEvent) (*CouncilResult, error) {
 	if events != nil {
-		defer close(events)
-	}
-	start := time.Now()
-
-	if strategy == "" {
-		strategy = "council"
-	}
-
-	if os.Getenv("MOCK_LLM") == "true" {
-		if events != nil {
-			mockModels := []string{"mock:claude-3.5-sonnet", "mock:gpt-4o", "mock:gemini-3-flash"}
-			mockCandidates := make([]CandidateAnswer, len(mockModels))
-			for i, m := range mockModels {
-				time.Sleep(5 * time.Millisecond)
-				cand := CandidateAnswer{
-					Model:   m,
-					Answer:  fmt.Sprintf("MOCK CANDIDATE %d (%s) for: %s", i+1, m, question),
-					Content: fmt.Sprintf("MOCK CANDIDATE %d (%s) for: %s", i+1, m, question),
-				}
-				mockCandidates[i] = cand
-				emitEvent(ctx, events, StreamEvent{
-					Type: EventCandidateDraft,
-					Data: CandidateDraftPayload{
-						Index:     i,
-						Model:     m,
-						ModelName: m,
-						Answer:    cand.Answer,
-						Content:   cand.Answer,
-						LatencyMs: int64((i + 1) * 5),
-					},
-				})
-			}
-
+		mockModels := []string{"mock:claude-3.5-sonnet", "mock:gpt-4o", "mock:gemini-3-flash"}
+		mockCandidates := make([]CandidateAnswer, len(mockModels))
+		for i, m := range mockModels {
 			time.Sleep(5 * time.Millisecond)
-			mockReviews := make([]PeerReview, len(mockModels))
-			for i, m := range mockModels {
-				rev := PeerReview{
-					Reviewer: m,
-					Review:   "RANKING: B, A, C\nREASONING: Response B is the most complete and accurate.",
-				}
-				mockReviews[i] = rev
-				emitEvent(ctx, events, StreamEvent{
-					Type: EventPeerReview,
-					Data: PeerReviewPayload{
-						Index:     i,
-						Reviewer:  m,
-						Review:    rev.Review,
-						Critique:  "Response B is the most complete and accurate.",
-						Ranking:   []string{"B", "A", "C"},
-						Scores:    map[string]int{"A": 2, "B": 3, "C": 1},
-						LatencyMs: int64((i + 1) * 5),
-					},
-				})
+			cand := CandidateAnswer{
+				Model:   m,
+				Answer:  fmt.Sprintf("MOCK CANDIDATE %d (%s) for: %s", i+1, m, question),
+				Content: fmt.Sprintf("MOCK CANDIDATE %d (%s) for: %s", i+1, m, question),
 			}
-
-			time.Sleep(5 * time.Millisecond)
-			finalAnswerText := "MOCK RESPONSE: Answer generated locally to preserve API quotas. Original Question: " + question
-			result := &CouncilResult{
-				FinalAnswer:      finalAnswerText,
-				Answer:           finalAnswerText,
-				Confidence:       0.99,
-				Source:           "mock:council",
-				Strategy:         strategy,
-				CandidateAnswers: mockCandidates,
-				Candidates:       mockCandidates,
-				PeerReviews:      mockReviews,
-				PeerReviewed:     true,
-				Latency:          time.Since(start),
-				LatencyStr:       time.Since(start).String(),
-			}
+			mockCandidates[i] = cand
 			emitEvent(ctx, events, StreamEvent{
-				Type: EventFinalAnswer,
-				Data: result,
+				Type: EventCandidateDraft,
+				Data: CandidateDraftPayload{
+					Index:     i,
+					Model:     m,
+					ModelName: m,
+					Answer:    cand.Answer,
+					Content:   cand.Answer,
+					LatencyMs: int64((i + 1) * 5),
+				},
 			})
-			return result, nil
 		}
 
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
+		mockReviews := make([]PeerReview, len(mockModels))
+		for i, m := range mockModels {
+			rev := PeerReview{
+				Reviewer: m,
+				Review:   "RANKING: B, A, C\nREASONING: Response B is the most complete and accurate.",
+			}
+			mockReviews[i] = rev
+			emitEvent(ctx, events, StreamEvent{
+				Type: EventPeerReview,
+				Data: PeerReviewPayload{
+					Index:     i,
+					Reviewer:  m,
+					Review:    rev.Review,
+					Critique:  "Response B is the most complete and accurate.",
+					Ranking:   []string{"B", "A", "C"},
+					Scores:    map[string]int{"A": 2, "B": 3, "C": 1},
+					LatencyMs: int64((i + 1) * 5),
+				},
+			})
+		}
+
+		time.Sleep(5 * time.Millisecond)
 		finalAnswerText := "MOCK RESPONSE: Answer generated locally to preserve API quotas. Original Question: " + question
-		return &CouncilResult{
+		result := &CouncilResult{
 			FinalAnswer:      finalAnswerText,
 			Answer:           finalAnswerText,
 			Confidence:       0.99,
 			Source:           "mock:council",
 			Strategy:         strategy,
-			CandidateAnswers: []CandidateAnswer{{Answer: finalAnswerText, Content: finalAnswerText, Model: "mock:council"}},
-			Candidates:       []CandidateAnswer{{Answer: finalAnswerText, Content: finalAnswerText, Model: "mock:council"}},
+			CandidateAnswers: mockCandidates,
+			Candidates:       mockCandidates,
+			PeerReviews:      mockReviews,
+			PeerReviewed:     true,
 			Latency:          time.Since(start),
 			LatencyStr:       time.Since(start).String(),
-		}, nil
+		}
+		emitEvent(ctx, events, StreamEvent{
+			Type: EventFinalAnswer,
+			Data: result,
+		})
+		return result, nil
 	}
 
-	// Build prompt for council members
-	prompt := customPrompt
-	if prompt == "" {
-		messages := buildMessages(question, chunks, history, "council")
-		prompt = flattenMessages(messages)
-	}
+	time.Sleep(10 * time.Millisecond)
+	finalAnswerText := "MOCK RESPONSE: Answer generated locally to preserve API quotas. Original Question: " + question
+	return &CouncilResult{
+		FinalAnswer:      finalAnswerText,
+		Answer:           finalAnswerText,
+		Confidence:       0.99,
+		Source:           "mock:council",
+		Strategy:         strategy,
+		CandidateAnswers: []CandidateAnswer{{Answer: finalAnswerText, Content: finalAnswerText, Model: "mock:council"}},
+		Candidates:       []CandidateAnswer{{Answer: finalAnswerText, Content: finalAnswerText, Model: "mock:council"}},
+		Latency:          time.Since(start),
+		LatencyStr:       time.Since(start).String(),
+	}, nil
+}
 
-	// ── Stage 1: Fan-out streaming to all council members ───────────
+func (o *Orchestrator) fanOutAndValidateCandidates(
+	ctx context.Context,
+	prompt, strategy string,
+	start time.Time,
+	events chan<- StreamEvent,
+) ([]CandidateAnswer, []CandidateAnswer, *CouncilResult, error) {
 	log.Printf("[Council] Collecting individual responses from %d models (streaming)", len(o.clients))
 	var fanOutSpan trace.Span
 	fanOutCtx := ctx
@@ -419,7 +407,7 @@ func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks 
 			Type: EventError,
 			Data: ErrorPayload{Code: 500, Message: errStr, Error: errStr},
 		})
-		return nil, fmt.Errorf("%s", errStr)
+		return nil, nil, nil, fmt.Errorf("%s", errStr)
 	}
 	if len(valid) == 1 {
 		log.Printf("[Council] Only 1 model responded, skipping peer review and chairman")
@@ -438,10 +426,19 @@ func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks 
 			Type: EventFinalAnswer,
 			Data: result,
 		})
-		return result, nil
+		return candidates, valid, result, nil
 	}
+	return candidates, valid, nil, nil
+}
 
-	// ── Stage 2: Peer Review streaming ──────────────────────────────
+func (o *Orchestrator) handlePeerReviewStream(
+	ctx context.Context,
+	question, strategy string,
+	valid, candidates []CandidateAnswer,
+	start time.Time,
+	skipChairman bool,
+	events chan<- StreamEvent,
+) (*CouncilResult, []PeerReview, bool) {
 	log.Printf("[Council] Peer review with %d valid candidates (streaming)", len(valid))
 	reviews := o.peerReviewStream(ctx, question, valid, events)
 
@@ -471,7 +468,7 @@ func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks 
 			Type: EventFinalAnswer,
 			Data: result,
 		})
-		return result, nil
+		return result, reviews, true
 	}
 
 	if skipChairman {
@@ -495,10 +492,21 @@ func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks 
 			Type: EventFinalAnswer,
 			Data: result,
 		})
-		return result, nil
+		return result, reviews, true
 	}
 
-	// ── Stage 3: Chairman Synthesis ─────────────────────────────────
+	return nil, reviews, false
+}
+
+func (o *Orchestrator) synthesizeChairmanStream(
+	ctx context.Context,
+	question string,
+	chunks []string,
+	valid, candidates []CandidateAnswer,
+	reviews []PeerReview,
+	strategy string,
+	start time.Time,
+) (*CouncilResult, bool, error) {
 	log.Printf("[Council] Chairman synthesis")
 	var chairmanSpan trace.Span
 	chairmanCtx := ctx
@@ -524,7 +532,7 @@ func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks 
 	if err != nil {
 		log.Printf("[Council] Chairman synthesis failed: %v, falling back to best candidate", err)
 		best := pickBestCandidate(valid, reviews)
-		result := &CouncilResult{
+		return &CouncilResult{
 			FinalAnswer:      best.Answer,
 			Answer:           best.Answer,
 			Confidence:       0.65,
@@ -536,15 +544,10 @@ func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks 
 			PeerReviewed:     true,
 			Latency:          time.Since(start),
 			LatencyStr:       time.Since(start).String(),
-		}
-		emitEvent(ctx, events, StreamEvent{
-			Type: EventFinalAnswer,
-			Data: result,
-		})
-		return result, nil
+		}, true, nil
 	}
 
-	result := &CouncilResult{
+	return &CouncilResult{
 		FinalAnswer:      chairmanResult.Answer,
 		Answer:           chairmanResult.Answer,
 		Reasoning:        chairmanResult.Reasoning,
@@ -557,37 +560,95 @@ func (o *Orchestrator) QueryStream(ctx context.Context, question string, chunks 
 		PeerReviewed:     len(reviews) > 0,
 		Latency:          time.Since(start),
 		LatencyStr:       time.Since(start).String(),
+	}, false, nil
+}
+
+func (o *Orchestrator) applyDeepReflection(
+	ctx context.Context,
+	question string,
+	chunks []string,
+	result *CouncilResult,
+) {
+	log.Printf("[Council] Running reflection loop (council_deep strategy)")
+	reflection, err := o.Reflect(ctx, question, chunks, result.FinalAnswer)
+	if err != nil {
+		log.Printf("[Council] Reflection failed: %v, keeping original answer", err)
+		return
+	}
+	result.Reflection = reflection
+	log.Printf("[Council] Reflection: quality=%s faithful=%v confidence=%.2f",
+		reflection.Quality, reflection.Faithful, reflection.Confidence)
+
+	if reflection.Quality == "needs_revision" {
+		log.Printf("[Council] Answer needs revision, running one more chairman pass")
+		revised, err := o.reviseAnswer(ctx, question, chunks, result.FinalAnswer, reflection)
+		if err != nil {
+			log.Printf("[Council] Revision failed: %v, keeping original answer", err)
+		} else {
+			result.FinalAnswer = revised.Answer
+			result.Answer = revised.Answer
+			result.Reasoning = revised.Reasoning
+			result.Confidence = revised.Confidence
+			result.Source = revised.Source
+		}
+	} else {
+		if reflection.Confidence > 0 {
+			result.Confidence = reflection.Confidence
+		}
+	}
+}
+
+// QueryStream executes full council deliberation while streaming lifecycle events.
+func (o *Orchestrator) QueryStream(
+	ctx context.Context,
+	question string,
+	chunks []string,
+	customPrompt string,
+	skipChairman bool,
+	strategy string,
+	history []ConversationTurn,
+	events chan<- StreamEvent,
+) (*CouncilResult, error) {
+	if events != nil {
+		defer close(events)
+	}
+	start := time.Now()
+
+	if strategy == "" {
+		strategy = "council"
+	}
+
+	if os.Getenv("MOCK_LLM") == "true" {
+		return o.mockQueryStream(ctx, question, strategy, start, events)
+	}
+
+	prompt := customPrompt
+	if prompt == "" {
+		messages := buildMessages(question, chunks, history, "council")
+		prompt = flattenMessages(messages)
+	}
+
+	// ── Stage 1: Fan-out streaming to all council members ───────────
+	candidates, valid, earlyResult, err := o.fanOutAndValidateCandidates(ctx, prompt, strategy, start, events)
+	if err != nil || earlyResult != nil {
+		return earlyResult, err
+	}
+
+	// ── Stage 2: Peer Review streaming ──────────────────────────────
+	earlyReviewResult, reviews, done := o.handlePeerReviewStream(ctx, question, strategy, valid, candidates, start, skipChairman, events)
+	if done {
+		return earlyReviewResult, nil
+	}
+
+	// ── Stage 3: Chairman Synthesis ─────────────────────────────────
+	result, isFallback, err := o.synthesizeChairmanStream(ctx, question, chunks, valid, candidates, reviews, strategy, start)
+	if err != nil || result == nil {
+		return result, err
 	}
 
 	// ── Stage 4 (optional): Reflection — only for council_deep ──────
-	if strategy == "council_deep" {
-		log.Printf("[Council] Running reflection loop (council_deep strategy)")
-		reflection, err := o.Reflect(ctx, question, chunks, chairmanResult.Answer)
-		if err != nil {
-			log.Printf("[Council] Reflection failed: %v, keeping original answer", err)
-		} else {
-			result.Reflection = reflection
-			log.Printf("[Council] Reflection: quality=%s faithful=%v confidence=%.2f",
-				reflection.Quality, reflection.Faithful, reflection.Confidence)
-
-			if reflection.Quality == "needs_revision" {
-				log.Printf("[Council] Answer needs revision, running one more chairman pass")
-				revised, err := o.reviseAnswer(ctx, question, chunks, chairmanResult.Answer, reflection)
-				if err != nil {
-					log.Printf("[Council] Revision failed: %v, keeping original answer", err)
-				} else {
-					result.FinalAnswer = revised.Answer
-					result.Answer = revised.Answer
-					result.Reasoning = revised.Reasoning
-					result.Confidence = revised.Confidence
-					result.Source = revised.Source
-				}
-			} else {
-				if reflection.Confidence > 0 {
-					result.Confidence = reflection.Confidence
-				}
-			}
-		}
+	if !isFallback && strategy == "council_deep" {
+		o.applyDeepReflection(ctx, question, chunks, result)
 	}
 
 	metrics.CouncilResponseTime.Observe(time.Since(start).Seconds())

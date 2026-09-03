@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -22,6 +23,14 @@ import (
 	"github.com/regular-life/CouncilAI/go-backend/internal/llm"
 	"github.com/regular-life/CouncilAI/go-backend/internal/telemetry"
 )
+
+type telemetryWorkerResult struct {
+	index       int
+	statusCode  int
+	traceID     string
+	traceparent string
+	isSSE       bool
+}
 
 type capturedHTTPCall struct {
 	Path        string
@@ -663,8 +672,13 @@ func TestChallengeM4_5StageLinkedSpanHierarchy_ExactParentChildIDs(t *testing.T)
 	}
 
 	tree := BuildSpanTree(t, spans)
+	rootSpanID := assertHierarchyRootSpan(t, tree, incomingTraceID, incomingParentID)
+	assertHierarchyCacheAndEmbed(t, tree, rootSpanID, incomingTraceID)
+	assertHierarchyCouncilStages(t, tree, rootSpanID, incomingTraceID)
+	assertHierarchySpansConsistent(t, spans, incomingTraceID)
+}
 
-	// 1. Root Server Span Verification
+func assertHierarchyRootSpan(t *testing.T, tree *SpanTree, incomingTraceID, incomingParentID string) trace.SpanID {
 	root := tree.Root
 	if root.Name != "HTTP POST /api/v1/query" {
 		t.Fatalf("expected root span name 'HTTP POST /api/v1/query', got %q", root.Name)
@@ -678,94 +692,55 @@ func TestChallengeM4_5StageLinkedSpanHierarchy_ExactParentChildIDs(t *testing.T)
 	if root.Parent.SpanID().String() != incomingParentID {
 		t.Errorf("expected root ParentSpanID %s, got %s", incomingParentID, root.Parent.SpanID())
 	}
+	return root.SpanContext.SpanID()
+}
 
-	rootSpanID := root.SpanContext.SpanID()
-
-	// 2. Stage 1: L1 Exact Cache Lookup
+func assertHierarchyCacheAndEmbed(t *testing.T, tree *SpanTree, rootSpanID trace.SpanID, incomingTraceID string) {
 	tree.AssertSpanCount(t, "cache.l1_lookup", 1)
 	l1Span := tree.ByName["cache.l1_lookup"][0]
-	if l1Span.SpanContext.TraceID().String() != incomingTraceID {
-		t.Errorf("L1 span TraceID %s != %s", l1Span.SpanContext.TraceID(), incomingTraceID)
-	}
-	if l1Span.Parent.SpanID() != rootSpanID {
-		t.Errorf("L1 span ParentSpanID %s != root SpanID %s", l1Span.Parent.SpanID(), rootSpanID)
-	}
-	if l1Span.SpanKind != trace.SpanKindInternal {
-		t.Errorf("L1 span kind expected Internal, got %v", l1Span.SpanKind)
+	if l1Span.SpanContext.TraceID().String() != incomingTraceID || l1Span.Parent.SpanID() != rootSpanID || l1Span.SpanKind != trace.SpanKindInternal {
+		t.Errorf("L1 span mismatch: trace=%s, parent=%s, kind=%v", l1Span.SpanContext.TraceID(), l1Span.Parent.SpanID(), l1Span.SpanKind)
 	}
 
-	// 3. Stage 2: Python /embed RPC call
 	tree.AssertSpanCount(t, "rag.embed", 1)
 	embedSpan := tree.ByName["rag.embed"][0]
-	if embedSpan.SpanContext.TraceID().String() != incomingTraceID {
-		t.Errorf("rag.embed span TraceID %s != %s", embedSpan.SpanContext.TraceID(), incomingTraceID)
-	}
-	if embedSpan.Parent.SpanID() != rootSpanID {
-		t.Errorf("rag.embed span ParentSpanID %s != root SpanID %s", embedSpan.Parent.SpanID(), rootSpanID)
-	}
-	if embedSpan.SpanKind != trace.SpanKindClient {
-		t.Errorf("rag.embed span kind expected Client, got %v", embedSpan.SpanKind)
+	if embedSpan.SpanContext.TraceID().String() != incomingTraceID || embedSpan.Parent.SpanID() != rootSpanID || embedSpan.SpanKind != trace.SpanKindClient {
+		t.Errorf("rag.embed span mismatch: trace=%s, parent=%s, kind=%v", embedSpan.SpanContext.TraceID(), embedSpan.Parent.SpanID(), embedSpan.SpanKind)
 	}
 
-	// 4. Stage 3: L2 RediSearch VSS Lookup
 	tree.AssertSpanCount(t, "cache.l2_lookup", 1)
 	l2Span := tree.ByName["cache.l2_lookup"][0]
-	if l2Span.SpanContext.TraceID().String() != incomingTraceID {
-		t.Errorf("L2 span TraceID %s != %s", l2Span.SpanContext.TraceID(), incomingTraceID)
+	if l2Span.SpanContext.TraceID().String() != incomingTraceID || l2Span.Parent.SpanID() != rootSpanID || l2Span.SpanKind != trace.SpanKindInternal {
+		t.Errorf("L2 span mismatch: trace=%s, parent=%s, kind=%v", l2Span.SpanContext.TraceID(), l2Span.Parent.SpanID(), l2Span.SpanKind)
 	}
-	if l2Span.Parent.SpanID() != rootSpanID {
-		t.Errorf("L2 span ParentSpanID %s != root SpanID %s", l2Span.Parent.SpanID(), rootSpanID)
-	}
-	if l2Span.SpanKind != trace.SpanKindInternal {
-		t.Errorf("L2 span kind expected Internal, got %v", l2Span.SpanKind)
-	}
+}
 
-	// 5. Stage 4: Council Candidate Fan-Out
+func assertHierarchyCouncilStages(t *testing.T, tree *SpanTree, rootSpanID trace.SpanID, incomingTraceID string) {
 	tree.AssertSpanCount(t, "council.candidate_fan_out", 1)
 	fanOutSpan := tree.ByName["council.candidate_fan_out"][0]
-	if fanOutSpan.SpanContext.TraceID().String() != incomingTraceID {
-		t.Errorf("fan_out span TraceID %s != %s", fanOutSpan.SpanContext.TraceID(), incomingTraceID)
-	}
-	if fanOutSpan.Parent.SpanID() != rootSpanID {
-		t.Errorf("fan_out span ParentSpanID %s != root SpanID %s", fanOutSpan.Parent.SpanID(), rootSpanID)
-	}
-	if fanOutSpan.SpanKind != trace.SpanKindInternal {
-		t.Errorf("fan_out span kind expected Internal, got %v", fanOutSpan.SpanKind)
+	if fanOutSpan.SpanContext.TraceID().String() != incomingTraceID || fanOutSpan.Parent.SpanID() != rootSpanID || fanOutSpan.SpanKind != trace.SpanKindInternal {
+		t.Errorf("fan_out span mismatch: trace=%s, parent=%s, kind=%v", fanOutSpan.SpanContext.TraceID(), fanOutSpan.Parent.SpanID(), fanOutSpan.SpanKind)
 	}
 
 	fanOutSpanID := fanOutSpan.SpanContext.SpanID()
-
-	// Child worker spans under Candidate Fan-Out
 	candidateSpans := tree.ByName["council.candidate_model"]
 	if len(candidateSpans) != 2 {
 		t.Fatalf("expected 2 candidate_model spans, got %d", len(candidateSpans))
 	}
 	for i, cs := range candidateSpans {
-		if cs.SpanContext.TraceID().String() != incomingTraceID {
-			t.Errorf("candidate_model[%d] TraceID %s != %s", i, cs.SpanContext.TraceID(), incomingTraceID)
-		}
-		if cs.Parent.SpanID() != fanOutSpanID {
-			t.Errorf("candidate_model[%d] ParentSpanID %s != fanOutSpanID %s", i, cs.Parent.SpanID(), fanOutSpanID)
-		}
-		if cs.SpanKind != trace.SpanKindClient {
-			t.Errorf("candidate_model[%d] kind expected Client, got %v", i, cs.SpanKind)
+		if cs.SpanContext.TraceID().String() != incomingTraceID || cs.Parent.SpanID() != fanOutSpanID || cs.SpanKind != trace.SpanKindClient {
+			t.Errorf("candidate_model[%d] mismatch: trace=%s, parent=%s, kind=%v", i, cs.SpanContext.TraceID(), cs.Parent.SpanID(), cs.SpanKind)
 		}
 	}
 
-	// 6. Stage 5: Council Chairman Deliberation
 	tree.AssertSpanCount(t, "council.chairman_deliberation", 1)
 	chairmanSpan := tree.ByName["council.chairman_deliberation"][0]
-	if chairmanSpan.SpanContext.TraceID().String() != incomingTraceID {
-		t.Errorf("chairman span TraceID %s != %s", chairmanSpan.SpanContext.TraceID(), incomingTraceID)
+	if chairmanSpan.SpanContext.TraceID().String() != incomingTraceID || chairmanSpan.Parent.SpanID() != rootSpanID || chairmanSpan.SpanKind != trace.SpanKindInternal {
+		t.Errorf("chairman span mismatch: trace=%s, parent=%s, kind=%v", chairmanSpan.SpanContext.TraceID(), chairmanSpan.Parent.SpanID(), chairmanSpan.SpanKind)
 	}
-	if chairmanSpan.Parent.SpanID() != rootSpanID {
-		t.Errorf("chairman span ParentSpanID %s != root SpanID %s", chairmanSpan.Parent.SpanID(), rootSpanID)
-	}
-	if chairmanSpan.SpanKind != trace.SpanKindInternal {
-		t.Errorf("chairman span kind expected Internal, got %v", chairmanSpan.SpanKind)
-	}
+}
 
-	// Verify all spans share exact same TraceID
+func assertHierarchySpansConsistent(t *testing.T, spans []tracetest.SpanStub, incomingTraceID string) {
 	for _, s := range spans {
 		if s.SpanContext.TraceID().String() != incomingTraceID {
 			t.Errorf("span %s has mismatched TraceID: %s != %s", s.Name, s.SpanContext.TraceID(), incomingTraceID)
@@ -1217,93 +1192,90 @@ func TestChallengerM4_MalformedTraceparent_ExtensiveMatrix(t *testing.T) {
 	for _, tc := range malformedCases {
 		tc := tc
 		t.Run(tc.name+"_JSON", func(t *testing.T) {
-			reqBody := fmt.Sprintf(`{"question": "Malformed test %s", "doc_id": "doc_malformed"}`, tc.name)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
-			req.Header.Set("Content-Type", "application/json")
-			if tc.headerVal != "" {
-				req.Header.Set("traceparent", tc.headerVal)
-			}
-
-			w := httptest.NewRecorder()
-			f.handlers.HandleQuery(w, req)
-
-			// 1. Must never return 500 Internal Server Error
-			if w.Code != http.StatusOK {
-				t.Fatalf("case %s failed with unexpected HTTP status %d: %s", tc.name, w.Code, w.Body.String())
-			}
-
-			// 2. Response headers must contain valid traceparent and X-Trace-ID
-			respTraceID := w.Header().Get("X-Trace-ID")
-			if respTraceID == "" {
-				t.Fatalf("case %s missing X-Trace-ID response header", tc.name)
-			}
-			if len(respTraceID) != 32 || respTraceID == "00000000000000000000000000000000" {
-				t.Fatalf("case %s produced invalid X-Trace-ID %q", tc.name, respTraceID)
-			}
-
-			respTraceparent := w.Header().Get("traceparent")
-			if respTraceparent == "" {
-				t.Fatalf("case %s missing traceparent response header", tc.name)
-			}
-			match := w3cTraceparentPattern.FindStringSubmatch(respTraceparent)
-			if len(match) != 4 {
-				t.Fatalf("case %s traceparent response header %q invalid format", tc.name, respTraceparent)
-			}
-			if match[1] != respTraceID {
-				t.Fatalf("case %s traceparent TraceID %s != X-Trace-ID %s", tc.name, match[1], respTraceID)
-			}
+			verifyMalformedTraceparentJSON(t, f, tc.name, tc.headerVal)
 		})
-
 		t.Run(tc.name+"_SSE", func(t *testing.T) {
-			reqBody := fmt.Sprintf(`{"question": "Malformed SSE test %s", "doc_id": "doc_malformed_sse"}`, tc.name)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "text/event-stream")
-			if tc.headerVal != "" {
-				req.Header.Set("traceparent", tc.headerVal)
-			}
-
-			w := httptest.NewRecorder()
-			f.handlers.HandleQuery(w, req)
-
-			if w.Code != http.StatusOK {
-				t.Fatalf("case %s SSE failed with status %d", tc.name, w.Code)
-			}
-
-			respContentType := w.Header().Get("Content-Type")
-			if !strings.HasPrefix(respContentType, "text/event-stream") {
-				t.Fatalf("case %s SSE expected Content-Type text/event-stream, got %q", tc.name, respContentType)
-			}
-
-			respTraceID := w.Header().Get("X-Trace-ID")
-			if respTraceID == "" || len(respTraceID) != 32 || respTraceID == "00000000000000000000000000000000" {
-				t.Fatalf("case %s SSE invalid X-Trace-ID %q", tc.name, respTraceID)
-			}
-
-			// Verify SSE frames parsed cleanly without error
-			scanner := bufio.NewScanner(w.Body)
-			var hasCandidateDraft, hasPeerReview, hasFinalAnswer bool
-			for scanner.Scan() {
-				line := scanner.Text()
-				if strings.HasPrefix(line, "event: error") {
-					t.Fatalf("case %s SSE emitted error frame on malformed traceparent: %s", tc.name, w.Body.String())
-				}
-				if strings.HasPrefix(line, "event: candidate_draft") {
-					hasCandidateDraft = true
-				}
-				if strings.HasPrefix(line, "event: peer_review") {
-					hasPeerReview = true
-				}
-				if strings.HasPrefix(line, "event: final_answer") {
-					hasFinalAnswer = true
-				}
-			}
-
-			if !hasCandidateDraft || !hasPeerReview || !hasFinalAnswer {
-				t.Errorf("case %s SSE missing expected event frames: draft=%v, review=%v, final=%v",
-					tc.name, hasCandidateDraft, hasPeerReview, hasFinalAnswer)
-			}
+			verifyMalformedTraceparentSSE(t, f, tc.name, tc.headerVal)
 		})
+	}
+}
+
+func verifyMalformedTraceparentJSON(t *testing.T, f *testTelemetryFixture, name, headerVal string) {
+	reqBody := fmt.Sprintf(`{"question": "Malformed test %s", "doc_id": "doc_malformed"}`, name)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	if headerVal != "" {
+		req.Header.Set("traceparent", headerVal)
+	}
+
+	w := httptest.NewRecorder()
+	f.handlers.HandleQuery(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("case %s failed with unexpected HTTP status %d: %s", name, w.Code, w.Body.String())
+	}
+
+	respTraceID := w.Header().Get("X-Trace-ID")
+	if respTraceID == "" || len(respTraceID) != 32 || respTraceID == "00000000000000000000000000000000" {
+		t.Fatalf("case %s produced invalid X-Trace-ID %q", name, respTraceID)
+	}
+
+	respTraceparent := w.Header().Get("traceparent")
+	match := w3cTraceparentPattern.FindStringSubmatch(respTraceparent)
+	if len(match) != 4 || match[1] != respTraceID {
+		t.Fatalf("case %s traceparent %q mismatch with %s", name, respTraceparent, respTraceID)
+	}
+}
+
+func verifyMalformedTraceparentSSE(t *testing.T, f *testTelemetryFixture, name, headerVal string) {
+	reqBody := fmt.Sprintf(`{"question": "Malformed SSE test %s", "doc_id": "doc_malformed_sse"}`, name)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if headerVal != "" {
+		req.Header.Set("traceparent", headerVal)
+	}
+
+	w := httptest.NewRecorder()
+	f.handlers.HandleQuery(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("case %s SSE failed with status %d", name, w.Code)
+	}
+	if !strings.HasPrefix(w.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("case %s SSE expected Content-Type text/event-stream", name)
+	}
+
+	respTraceID := w.Header().Get("X-Trace-ID")
+	if respTraceID == "" || len(respTraceID) != 32 || respTraceID == "00000000000000000000000000000000" {
+		t.Fatalf("case %s SSE invalid X-Trace-ID %q", name, respTraceID)
+	}
+
+	verifyMalformedSSEFrames(t, w.Body, name)
+}
+
+func verifyMalformedSSEFrames(t *testing.T, r io.Reader, name string) {
+	scanner := bufio.NewScanner(r)
+	var hasCandidateDraft, hasPeerReview, hasFinalAnswer bool
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event: error") {
+			t.Fatalf("case %s SSE emitted error frame on malformed traceparent", name)
+		}
+		if strings.HasPrefix(line, "event: candidate_draft") {
+			hasCandidateDraft = true
+		}
+		if strings.HasPrefix(line, "event: peer_review") {
+			hasPeerReview = true
+		}
+		if strings.HasPrefix(line, "event: final_answer") {
+			hasFinalAnswer = true
+		}
+	}
+
+	if !hasCandidateDraft || !hasPeerReview || !hasFinalAnswer {
+		t.Errorf("case %s SSE missing expected event frames: draft=%v, review=%v, final=%v",
+			name, hasCandidateDraft, hasPeerReview, hasFinalAnswer)
 	}
 }
 
@@ -1322,54 +1294,18 @@ func TestChallengerM4_HighConcurrency_RaceDetector_64Goroutines(t *testing.T) {
 
 	startBarrier := make(chan struct{})
 
-	type workerResult struct {
-		index       int
-		statusCode  int
-		traceID     string
-		traceparent string
-		isSSE       bool
-		err         error
-	}
-
-	results := make([]workerResult, numWorkers)
+	results := make([]telemetryWorkerResult, numWorkers)
 
 	for i := 0; i < numWorkers; i++ {
 		go func(idx int) {
 			defer wg.Done()
-
-			// Decide configuration per worker:
-			// 0-15: JSON with incoming traceparent
-			// 16-31: JSON without traceparent
-			// 32-47: SSE with incoming traceparent
-			// 48-63: SSE with malformed traceparent
-			isSSE := idx >= 32
-			hasIncomingTrace := (idx < 16) || (idx >= 32 && idx < 48)
-			hasMalformedTrace := idx >= 48
-
-			reqBody := fmt.Sprintf(`{"question": "Concurrency query worker %d", "doc_id": "doc_conc_%d"}`, idx, idx%4)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
-			req.Header.Set("Content-Type", "application/json")
-
-			if isSSE {
-				req.Header.Set("Accept", "text/event-stream")
-			}
-
-			expectedTraceID := ""
-			if hasIncomingTrace {
-				expectedTraceID = fmt.Sprintf("a%031x", idx)
-				incomingParentID := fmt.Sprintf("b%015x", idx)
-				req.Header.Set("traceparent", fmt.Sprintf("00-%s-%s-01", expectedTraceID, incomingParentID))
-			} else if hasMalformedTrace {
-				req.Header.Set("traceparent", fmt.Sprintf("malformed-header-worker-%d-!", idx))
-			}
-
-			// Synchronize all goroutines to fire at the exact same instant
+			req, isSSE := buildConcurrencyWorkerRequest(idx)
 			<-startBarrier
 
 			w := httptest.NewRecorder()
 			f.handlers.HandleQuery(w, req)
 
-			results[idx] = workerResult{
+			results[idx] = telemetryWorkerResult{
 				index:       idx,
 				statusCode:  w.Code,
 				traceID:     w.Header().Get("X-Trace-ID"),
@@ -1379,11 +1315,37 @@ func TestChallengerM4_HighConcurrency_RaceDetector_64Goroutines(t *testing.T) {
 		}(i)
 	}
 
-	// Release all 64 goroutines simultaneously
 	close(startBarrier)
 	wg.Wait()
 
-	// Analyze results
+	verifyConcurrencyWorkerResults(t, results, numWorkers)
+}
+
+func buildConcurrencyWorkerRequest(idx int) (*http.Request, bool) {
+	isSSE := idx >= 32
+	hasIncomingTrace := (idx < 16) || (idx >= 32 && idx < 48)
+	hasMalformedTrace := idx >= 48
+
+	reqBody := fmt.Sprintf(`{"question": "Concurrency query worker %d", "doc_id": "doc_conc_%d"}`, idx, idx%4)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	if isSSE {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+
+	if hasIncomingTrace {
+		expectedTraceID := fmt.Sprintf("a%031x", idx)
+		incomingParentID := fmt.Sprintf("b%015x", idx)
+		req.Header.Set("traceparent", fmt.Sprintf("00-%s-%s-01", expectedTraceID, incomingParentID))
+	} else if hasMalformedTrace {
+		req.Header.Set("traceparent", fmt.Sprintf("malformed-header-worker-%d-!", idx))
+	}
+
+	return req, isSSE
+}
+
+func verifyConcurrencyWorkerResults(t *testing.T, results []telemetryWorkerResult, numWorkers int) {
 	seenTraceIDs := make(map[string]int)
 
 	for i, res := range results {
@@ -1397,7 +1359,6 @@ func TestChallengerM4_HighConcurrency_RaceDetector_64Goroutines(t *testing.T) {
 			t.Fatalf("worker %d produced invalid traceparent header %q", i, res.traceparent)
 		}
 
-		// Verify that workers with explicit incoming traceparent received their exact TraceID
 		if (i < 16) || (i >= 32 && i < 48) {
 			expectedTraceID := fmt.Sprintf("a%031x", i)
 			if res.traceID != expectedTraceID {
@@ -1408,9 +1369,8 @@ func TestChallengerM4_HighConcurrency_RaceDetector_64Goroutines(t *testing.T) {
 		seenTraceIDs[res.traceID]++
 	}
 
-	// Verify that each worker without an incoming traceparent received a unique TraceID
 	if len(seenTraceIDs) < numWorkers {
-		t.Fatalf("detected duplicate trace IDs across concurrent requests: %d unique traces out of %d requests",
+		t.Fatalf("detected duplicate trace IDs: %d unique traces out of %d requests",
 			len(seenTraceIDs), numWorkers)
 	}
 }
@@ -1442,7 +1402,17 @@ func TestChallengerM4_SSEStreaming_TraceContextIntegrity(t *testing.T) {
 		t.Fatalf("expected HTTP 200 OK for SSE query, got %d", w.Code)
 	}
 
-	// 1. Response Headers Verification
+	verifySSETraceResponseHeaders(t, w, incomingTraceID)
+	parseAndVerifySSETraceFrames(t, w.Body)
+
+	spans := f.exporter.GetSpans()
+	if len(spans) == 0 {
+		t.Fatal("expected spans to be recorded for SSE deliberation, got 0")
+	}
+	verifySSETraceSpanTree(t, spans, incomingTraceID)
+}
+
+func verifySSETraceResponseHeaders(t *testing.T, w *httptest.ResponseRecorder, incomingTraceID string) {
 	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Errorf("expected Content-Type text/event-stream, got %q", ct)
 	}
@@ -1453,81 +1423,100 @@ func TestChallengerM4_SSEStreaming_TraceContextIntegrity(t *testing.T) {
 		t.Errorf("expected response traceparent header %q to contain incoming TraceID %s",
 			w.Header().Get("traceparent"), incomingTraceID)
 	}
+}
 
-	// 2. SSE Frame Stream Parsing & Content Validation
-	scanner := bufio.NewScanner(w.Body)
+func parseAndVerifySSETraceFrames(t *testing.T, r io.Reader) {
+	candidateDrafts, peerReviews, finalAnswer, errorPayloads := parseSSETracePayloads(t, r)
+	validateSSETracePayloads(t, candidateDrafts, peerReviews, finalAnswer, errorPayloads)
+}
+
+func parseSSETracePayloads(t *testing.T, r io.Reader) (
+	candidateDrafts []council.CandidateDraftPayload,
+	peerReviews []council.PeerReviewPayload,
+	finalAnswer *QueryResponse,
+	errorPayloads []map[string]interface{},
+) {
+	scanner := bufio.NewScanner(r)
 	var currentEvent string
-	var candidateDrafts []council.CandidateDraftPayload
-	var peerReviews []council.PeerReviewPayload
-	var finalAnswer *QueryResponse
-	var errorPayloads []map[string]interface{}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event: ") {
 			currentEvent = strings.TrimPrefix(line, "event: ")
-		} else if strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		if strings.HasPrefix(line, "data: ") {
 			dataJSON := strings.TrimPrefix(line, "data: ")
-			switch currentEvent {
-			case "candidate_draft":
-				var draft council.CandidateDraftPayload
-				if err := json.Unmarshal([]byte(dataJSON), &draft); err != nil {
-					t.Fatalf("failed to unmarshal candidate_draft data: %v", err)
-				}
-				candidateDrafts = append(candidateDrafts, draft)
-			case "peer_review":
-				var review council.PeerReviewPayload
-				if err := json.Unmarshal([]byte(dataJSON), &review); err != nil {
-					t.Fatalf("failed to unmarshal peer_review data: %v", err)
-				}
-				peerReviews = append(peerReviews, review)
-			case "final_answer":
-				var resp QueryResponse
-				if err := json.Unmarshal([]byte(dataJSON), &resp); err != nil {
-					t.Fatalf("failed to unmarshal final_answer data: %v", err)
-				}
-				finalAnswer = &resp
-			case "error":
-				var errMap map[string]interface{}
-				_ = json.Unmarshal([]byte(dataJSON), &errMap)
-				errorPayloads = append(errorPayloads, errMap)
-			}
+			collectSSETracePayload(t, currentEvent, dataJSON, &candidateDrafts, &peerReviews, &finalAnswer, &errorPayloads)
 		}
 	}
+	return
+}
 
+func collectSSETracePayload(
+	t *testing.T,
+	currentEvent, dataJSON string,
+	drafts *[]council.CandidateDraftPayload,
+	reviews *[]council.PeerReviewPayload,
+	finalAns **QueryResponse,
+	errs *[]map[string]interface{},
+) {
+	switch currentEvent {
+	case "candidate_draft":
+		var draft council.CandidateDraftPayload
+		if err := json.Unmarshal([]byte(dataJSON), &draft); err != nil {
+			t.Fatalf("failed to unmarshal candidate_draft data: %v", err)
+		}
+		*drafts = append(*drafts, draft)
+	case "peer_review":
+		var review council.PeerReviewPayload
+		if err := json.Unmarshal([]byte(dataJSON), &review); err != nil {
+			t.Fatalf("failed to unmarshal peer_review data: %v", err)
+		}
+		*reviews = append(*reviews, review)
+	case "final_answer":
+		var resp QueryResponse
+		if err := json.Unmarshal([]byte(dataJSON), &resp); err != nil {
+			t.Fatalf("failed to unmarshal final_answer data: %v", err)
+		}
+		*finalAns = &resp
+	case "error":
+		var errMap map[string]interface{}
+		_ = json.Unmarshal([]byte(dataJSON), &errMap)
+		*errs = append(*errs, errMap)
+	}
+}
+
+func validateSSETracePayloads(
+	t *testing.T,
+	drafts []council.CandidateDraftPayload,
+	reviews []council.PeerReviewPayload,
+	finalAnswer *QueryResponse,
+	errorPayloads []map[string]interface{},
+) {
 	if len(errorPayloads) > 0 {
 		t.Fatalf("unexpected error frames encountered in SSE stream: %v", errorPayloads)
 	}
-	if len(candidateDrafts) < 2 {
-		t.Fatalf("expected at least 2 candidate drafts streamed, got %d", len(candidateDrafts))
+	if len(drafts) < 2 {
+		t.Fatalf("expected at least 2 candidate drafts streamed, got %d", len(drafts))
 	}
-	if len(peerReviews) < 2 {
-		t.Fatalf("expected at least 2 peer reviews streamed, got %d", len(peerReviews))
+	if len(reviews) < 2 {
+		t.Fatalf("expected at least 2 peer reviews streamed, got %d", len(reviews))
 	}
-	if finalAnswer == nil {
-		t.Fatal("expected final_answer event in SSE stream, got nil")
+	if finalAnswer == nil || finalAnswer.Answer == "" {
+		t.Fatalf("expected non-empty final answer text in final_answer payload: %v", finalAnswer)
 	}
-	if finalAnswer.Answer == "" {
-		t.Fatal("expected non-empty final answer text in final_answer payload")
-	}
+}
 
-	// 3. OpenTelemetry Span Tree Verification
-	spans := f.exporter.GetSpans()
-	if len(spans) == 0 {
-		t.Fatal("expected spans to be recorded for SSE deliberation, got 0")
-	}
-
+func verifySSETraceSpanTree(t *testing.T, spans []tracetest.SpanStub, incomingTraceID string) {
 	tree := BuildSpanTree(t, spans)
 
-	// Verify all spans share incoming TraceID
 	for _, s := range spans {
 		if s.SpanContext.TraceID().String() != incomingTraceID {
-			t.Errorf("span %q TraceID %s does not match expected TraceID %s",
-				s.Name, s.SpanContext.TraceID(), incomingTraceID)
+			t.Errorf("span %q TraceID %s != expected TraceID %s", s.Name, s.SpanContext.TraceID(), incomingTraceID)
 		}
 	}
 
-	// Verify Root Attributes for SSE
 	var foundSSEAttr, foundDocAttr bool
 	for _, a := range tree.Root.Attributes {
 		if a.Key == "query.sse" && a.Value.AsBool() == true {
@@ -1537,14 +1526,10 @@ func TestChallengerM4_SSEStreaming_TraceContextIntegrity(t *testing.T) {
 			foundDocAttr = true
 		}
 	}
-	if !foundSSEAttr {
-		t.Error("expected query.sse=true attribute on root span")
-	}
-	if !foundDocAttr {
-		t.Error("expected query.doc_id=doc_sse_trace attribute on root span")
+	if !foundSSEAttr || !foundDocAttr {
+		t.Errorf("root span missing expected attributes: sse=%v, doc=%v", foundSSEAttr, foundDocAttr)
 	}
 
-	// Verify Council Stage Spans are properly linked to Root
 	rootName := "HTTP POST /api/v1/query"
 	tree.AssertParent(t, "council.candidate_fan_out", rootName)
 	tree.AssertParent(t, "council.candidate_model", "council.candidate_fan_out")

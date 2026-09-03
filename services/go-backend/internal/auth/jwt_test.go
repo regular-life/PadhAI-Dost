@@ -169,6 +169,87 @@ func TestEmpiricalC2_JWT_ExpirationLifecycle(t *testing.T) {
 	}
 }
 
+func verifyTamperSignatureBitFlip(t *testing.T, mgr *auth.JWTManager, headerB64, payloadB64, sigB64 string) {
+	tamperedSigBytes := []byte(sigB64)
+	if len(tamperedSigBytes) > 5 {
+		if tamperedSigBytes[5] == 'X' {
+			tamperedSigBytes[5] = 'Y'
+		} else {
+			tamperedSigBytes[5] = 'X'
+		}
+	}
+	tamperedToken := fmt.Sprintf("%s.%s.%s", headerB64, payloadB64, string(tamperedSigBytes))
+	if _, err := mgr.ValidateToken(tamperedToken); err == nil {
+		t.Fatal("SECURITY FAILURE: Tampered signature was accepted by ValidateToken!")
+	}
+}
+
+func verifyTamperPayloadPrivilegeEscalation(t *testing.T, mgr *auth.JWTManager, headerB64, payloadB64, sigB64 string) {
+	rawPayload, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		t.Fatalf("failed to decode payload base64: %v", err)
+	}
+
+	var payloadMap map[string]interface{}
+	if err := json.Unmarshal(rawPayload, &payloadMap); err != nil {
+		t.Fatalf("failed to unmarshal payload JSON: %v", err)
+	}
+
+	payloadMap["user_id"] = "admin_super_user"
+	tamperedPayloadBytes, _ := json.Marshal(payloadMap)
+	tamperedPayloadB64 := base64.RawURLEncoding.EncodeToString(tamperedPayloadBytes)
+	tamperedToken := fmt.Sprintf("%s.%s.%s", headerB64, tamperedPayloadB64, sigB64)
+
+	if _, err = mgr.ValidateToken(tamperedToken); err == nil {
+		t.Fatal("SECURITY FAILURE: Payload privilege escalation accepted without valid signature!")
+	}
+}
+
+func verifyTamperAlgorithmConfusion(t *testing.T, mgr *auth.JWTManager) {
+	noneHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	nonePayload := base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"admin","iss":"council-ai"}`))
+	noneToken := fmt.Sprintf("%s.%s.", noneHeader, nonePayload)
+
+	if _, err := mgr.ValidateToken(noneToken); err == nil {
+		t.Fatal("SECURITY FAILURE: alg=none token was accepted by ValidateToken!")
+	}
+}
+
+func verifyTamperForeignSecret(t *testing.T, mgr *auth.JWTManager) {
+	attackerMgr := auth.NewJWTManager("attacker-controlled-secret-key", 1*time.Hour)
+	attackerToken, err := attackerMgr.GenerateToken("impersonated_admin")
+	if err != nil {
+		t.Fatalf("failed to generate attacker token: %v", err)
+	}
+	if _, err = mgr.ValidateToken(attackerToken); err == nil {
+		t.Fatal("SECURITY FAILURE: Token signed with foreign secret key was accepted!")
+	}
+}
+
+func verifyMalformedTokens(t *testing.T, mgr *auth.JWTManager, headerB64, payloadB64, validToken string) {
+	malformedCases := []struct {
+		name  string
+		token string
+	}{
+		{name: "Empty string", token: ""},
+		{name: "Single part", token: "headeronlywithoutdot"},
+		{name: "Two parts (missing signature)", token: headerB64 + "." + payloadB64},
+		{name: "Four parts", token: validToken + ".extrapart"},
+		{name: "Garbage ASCII", token: "not.a.valid.jwt.at.all"},
+		{name: "Non-base64 characters", token: "header!.payload@.signature#"},
+		{name: "Trailing garbage", token: validToken + "  "},
+		{name: "Leading garbage", token: "  " + validToken},
+	}
+
+	for _, tc := range malformedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mgr.ValidateToken(tc.token); err == nil {
+				t.Fatalf("SECURITY FAILURE: Malformed token %q was accepted!", tc.token)
+			}
+		})
+	}
+}
+
 func TestEmpiricalC2_JWT_TamperScenarios(t *testing.T) {
 	t.Parallel()
 	secret := "tamper-defense-secret-key-abcdef123"
@@ -187,101 +268,27 @@ func TestEmpiricalC2_JWT_TamperScenarios(t *testing.T) {
 
 	t.Run("Tamper_Signature_BitFlip", func(t *testing.T) {
 		t.Parallel()
-		tamperedSigBytes := []byte(sigB64)
-		if len(tamperedSigBytes) > 5 {
-			if tamperedSigBytes[5] == 'X' {
-				tamperedSigBytes[5] = 'Y'
-			} else {
-				tamperedSigBytes[5] = 'X'
-			}
-		}
-		tamperedToken := fmt.Sprintf("%s.%s.%s", headerB64, payloadB64, string(tamperedSigBytes))
-
-		_, err := mgr.ValidateToken(tamperedToken)
-		if err == nil {
-			t.Fatal("SECURITY FAILURE: Tampered signature was accepted by ValidateToken!")
-		}
+		verifyTamperSignatureBitFlip(t, mgr, headerB64, payloadB64, sigB64)
 	})
 
 	t.Run("Tamper_Payload_PrivilegeEscalation", func(t *testing.T) {
 		t.Parallel()
-		rawPayload, err := base64.RawURLEncoding.DecodeString(payloadB64)
-		if err != nil {
-			t.Fatalf("failed to decode payload base64: %v", err)
-		}
-
-		var payloadMap map[string]interface{}
-		if err := json.Unmarshal(rawPayload, &payloadMap); err != nil {
-			t.Fatalf("failed to unmarshal payload JSON: %v", err)
-		}
-
-		payloadMap["user_id"] = "admin_super_user"
-		tamperedPayloadBytes, _ := json.Marshal(payloadMap)
-		tamperedPayloadB64 := base64.RawURLEncoding.EncodeToString(tamperedPayloadBytes)
-
-		tamperedToken := fmt.Sprintf("%s.%s.%s", headerB64, tamperedPayloadB64, sigB64)
-
-		_, err = mgr.ValidateToken(tamperedToken)
-		if err == nil {
-			t.Fatal("SECURITY FAILURE: Payload privilege escalation accepted without valid signature!")
-		}
+		verifyTamperPayloadPrivilegeEscalation(t, mgr, headerB64, payloadB64, sigB64)
 	})
 
 	t.Run("Tamper_AlgorithmConfusion_NoneAlg", func(t *testing.T) {
 		t.Parallel()
-		noneHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-		nonePayload := base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"admin","iss":"council-ai"}`))
-		noneToken := fmt.Sprintf("%s.%s.", noneHeader, nonePayload)
-
-		_, err := mgr.ValidateToken(noneToken)
-		if err == nil {
-			t.Fatal("SECURITY FAILURE: alg=none token was accepted by ValidateToken!")
-		}
-		if !strings.Contains(err.Error(), "unexpected signing method") && !strings.Contains(err.Error(), "token is unverifiable") && !strings.Contains(err.Error(), "invalid token") {
-			t.Logf("Observed none alg rejection error: %v", err)
-		}
+		verifyTamperAlgorithmConfusion(t, mgr)
 	})
 
 	t.Run("Tamper_KeyConfusion_DifferentSecret", func(t *testing.T) {
 		t.Parallel()
-		attackerMgr := auth.NewJWTManager("attacker-controlled-secret-key", 1*time.Hour)
-		attackerToken, err := attackerMgr.GenerateToken("impersonated_admin")
-		if err != nil {
-			t.Fatalf("failed to generate attacker token: %v", err)
-		}
-
-		_, err = mgr.ValidateToken(attackerToken)
-		if err == nil {
-			t.Fatal("SECURITY FAILURE: Token signed with foreign secret key was accepted!")
-		}
+		verifyTamperForeignSecret(t, mgr)
 	})
 
 	t.Run("Tamper_Malformed_TruncatedAndGarbageTokens", func(t *testing.T) {
 		t.Parallel()
-		malformedCases := []struct {
-			name  string
-			token string
-		}{
-			{name: "Empty string", token: ""},
-			{name: "Single part", token: "headeronlywithoutdot"},
-			{name: "Two parts (missing signature)", token: headerB64 + "." + payloadB64},
-			{name: "Four parts", token: validToken + ".extrapart"},
-			{name: "Garbage ASCII", token: "not.a.valid.jwt.at.all"},
-			{name: "Non-base64 characters", token: "header!.payload@.signature#"},
-			{name: "Trailing garbage", token: validToken + "  "},
-			{name: "Leading garbage", token: "  " + validToken},
-		}
-
-		for _, tc := range malformedCases {
-			tc := tc
-			t.Run(tc.name, func(t *testing.T) {
-				t.Parallel()
-				_, err := mgr.ValidateToken(tc.token)
-				if err == nil {
-					t.Fatalf("SECURITY FAILURE: Malformed token %q was accepted!", tc.token)
-				}
-			})
-		}
+		verifyMalformedTokens(t, mgr, headerB64, payloadB64, validToken)
 	})
 }
 

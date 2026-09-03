@@ -80,10 +80,7 @@ func (c *GeminiClient) Generate(ctx context.Context, prompt string) (*Response, 
 }
 
 // GenerateChat sends a full multi-turn conversation with system prompt support.
-func (c *GeminiClient) GenerateChat(ctx context.Context, opts GenerateOptions) (*Response, error) {
-	req := geminiRequest{}
-
-	// Build generation config
+func buildGeminiGenerationConfig(opts GenerateOptions) *geminiGenerationConfig {
 	genCfg := &geminiGenerationConfig{}
 	hasGenCfg := false
 	if opts.Temperature != nil {
@@ -99,18 +96,23 @@ func (c *GeminiClient) GenerateChat(ctx context.Context, opts GenerateOptions) (
 		hasGenCfg = true
 	}
 	if hasGenCfg {
-		req.GenerationConfig = genCfg
+		return genCfg
+	}
+	return nil
+}
+
+func buildGeminiRequest(opts GenerateOptions) (*geminiRequest, error) {
+	req := geminiRequest{
+		GenerationConfig: buildGeminiGenerationConfig(opts),
 	}
 
 	if opts.EnableSearch {
 		req.Tools = []geminiTool{{GoogleSearch: &struct{}{}}}
 	}
 
-	// Map messages to Gemini format
 	for _, msg := range opts.Messages {
 		switch msg.Role {
 		case "system":
-			// Gemini uses a dedicated systemInstruction field
 			req.SystemInstruction = &geminiContent{
 				Parts: []geminiPart{{Text: msg.Content}},
 			}
@@ -120,7 +122,6 @@ func (c *GeminiClient) GenerateChat(ctx context.Context, opts GenerateOptions) (
 				Parts: []geminiPart{{Text: msg.Content}},
 			})
 		case "assistant":
-			// Gemini calls this "model"
 			req.Contents = append(req.Contents, geminiContent{
 				Role:  "model",
 				Parts: []geminiPart{{Text: msg.Content}},
@@ -128,9 +129,37 @@ func (c *GeminiClient) GenerateChat(ctx context.Context, opts GenerateOptions) (
 		}
 	}
 
-	// Must have at least one content entry
 	if len(req.Contents) == 0 {
 		return nil, fmt.Errorf("at least one user or assistant message is required")
+	}
+	return &req, nil
+}
+
+func parseGeminiResponse(body []byte, model string) (*Response, error) {
+	var gResp geminiResponse
+	if err := json.Unmarshal(body, &gResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if len(gResp.Candidates) == 0 || len(gResp.Candidates[0].Content.Parts) == 0 {
+		return nil, fmt.Errorf("no content in Gemini response")
+	}
+
+	return &Response{
+		Answer: gResp.Candidates[0].Content.Parts[0].Text,
+		Model:  model,
+		Usage: Usage{
+			PromptTokens:     gResp.UsageMetadata.PromptTokenCount,
+			CompletionTokens: gResp.UsageMetadata.CandidatesTokenCount,
+			TotalTokens:      gResp.UsageMetadata.TotalTokenCount,
+		},
+	}, nil
+}
+
+func (c *GeminiClient) GenerateChat(ctx context.Context, opts GenerateOptions) (*Response, error) {
+	req, err := buildGeminiRequest(opts)
+	if err != nil {
+		return nil, err
 	}
 
 	jsonBody, err := json.Marshal(req)
@@ -164,24 +193,7 @@ func (c *GeminiClient) GenerateChat(ctx context.Context, opts GenerateOptions) (
 		return nil, fmt.Errorf("Gemini API error (status %d): %s", resp.StatusCode, string(body))
 	}
 
-	var gResp geminiResponse
-	if err := json.Unmarshal(body, &gResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if len(gResp.Candidates) == 0 || len(gResp.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("no content in Gemini response")
-	}
-
-	return &Response{
-		Answer: gResp.Candidates[0].Content.Parts[0].Text,
-		Model:  c.model,
-		Usage: Usage{
-			PromptTokens:     gResp.UsageMetadata.PromptTokenCount,
-			CompletionTokens: gResp.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:      gResp.UsageMetadata.TotalTokenCount,
-		},
-	}, nil
+	return parseGeminiResponse(body, c.model)
 }
 
 // ModelName returns the qualified model identifier prefixed with the provider name.

@@ -614,18 +614,106 @@ func TestEmpiricalC2_HTTP_MassiveStampedeDuplicateRegistration_100Goroutines(t *
 	}
 }
 
+func runMixedTrafficAuthAction(t *testing.T, workerID int, handler *handlers.AuthHandler) {
+	switch workerID % 4 {
+	case 0:
+		uname := fmt.Sprintf("mixed_reg_%d", workerID)
+		body := fmt.Sprintf(`{"username": "%s", "password": "MixedPassword123!"}`, uname)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/register", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		handler.HandleRegister(w, req)
+		if w.Result().StatusCode != http.StatusCreated {
+			t.Errorf("mixed reg failed for %s: %d", uname, w.Result().StatusCode)
+		}
+	case 1:
+		uname := fmt.Sprintf("preseed_user_%d", workerID%20)
+		body := fmt.Sprintf(`{"username": "%s", "password": "PreseedPass123!"}`, uname)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		handler.HandleLogin(w, req)
+		if w.Result().StatusCode != http.StatusOK {
+			t.Errorf("mixed login failed for %s: %d", uname, w.Result().StatusCode)
+		}
+	case 2:
+		uname := fmt.Sprintf("preseed_user_%d", workerID%20)
+		body := fmt.Sprintf(`{"username": "%s", "password": "WrongPassword999!"}`, uname)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		handler.HandleLogin(w, req)
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("expected 401 for wrong pass, got %d", w.Result().StatusCode)
+		}
+	case 3:
+		uname := fmt.Sprintf("ghost_worker_user_%d", workerID)
+		body := fmt.Sprintf(`{"username": "%s", "password": "Password123!"}`, uname)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		handler.HandleLogin(w, req)
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("expected 401 for ghost user, got %d", w.Result().StatusCode)
+		}
+	}
+}
+
+func runMixedTrafficProtectedAction(t *testing.T, workerID int, protectedEndpoint http.Handler, jwtMgr *auth.JWTManager) {
+	switch workerID % 4 {
+	case 0:
+		token, _ := jwtMgr.GenerateToken(fmt.Sprintf("preseed_user_%d", workerID%20))
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		protectedEndpoint.ServeHTTP(w, req)
+		if w.Result().StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK from protected endpoint, got %d", w.Result().StatusCode)
+		}
+	case 1:
+		token, _ := jwtMgr.GenerateToken("valid_user")
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		req.Header.Set("Authorization", "Bearer "+token+"corrupted_sig")
+		w := httptest.NewRecorder()
+		protectedEndpoint.ServeHTTP(w, req)
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("expected 401 for tampered token, got %d", w.Result().StatusCode)
+		}
+	case 2:
+		expiredMgr := auth.NewJWTManager("mixed-traffic-jwt-secret-key-32b", -5*time.Minute)
+		expiredToken, _ := expiredMgr.GenerateToken("expired_user")
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		req.Header.Set("Authorization", "Bearer "+expiredToken)
+		w := httptest.NewRecorder()
+		protectedEndpoint.ServeHTTP(w, req)
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("expected 401 for expired token, got %d", w.Result().StatusCode)
+		}
+	case 3:
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+		req.Header.Set("Authorization", "InvalidScheme xyz")
+		w := httptest.NewRecorder()
+		protectedEndpoint.ServeHTTP(w, req)
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("expected 401 for invalid scheme, got %d", w.Result().StatusCode)
+		}
+	}
+}
+
+func runMixedTrafficWorker(t *testing.T, workerID int, handler *handlers.AuthHandler, protectedEndpoint http.Handler, jwtMgr *auth.JWTManager) {
+	if workerID%2 == 0 {
+		runMixedTrafficAuthAction(t, workerID, handler)
+	} else {
+		runMixedTrafficProtectedAction(t, workerID, protectedEndpoint, jwtMgr)
+	}
+}
+
 func TestEmpiricalC2_HTTP_MixedConcurrentTraffic_Interleaved(t *testing.T) {
 	t.Parallel()
 	jwtMgr := auth.NewJWTManager("mixed-traffic-jwt-secret-key-32b", 1*time.Hour)
 	repo := auth.NewMemoryUserRepository()
 	handler := handlers.NewAuthHandler(jwtMgr, repo)
 
-	// Pre-seed some existing users
 	for i := 0; i < 20; i++ {
 		_ = repo.SeedDemoUser(context.Background(), fmt.Sprintf("preseed_user_%d", i), "PreseedPass123!")
 	}
 
-	// Protected handler behind AuthMiddleware
 	protectedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid := middleware.GetUserID(r.Context())
 		if uid == "anonymous" {
@@ -647,96 +735,7 @@ func TestEmpiricalC2_HTTP_MixedConcurrentTraffic_Interleaved(t *testing.T) {
 		workerID := i
 		go func() {
 			defer wg.Done()
-			switch workerID % 8 {
-			case 0:
-				// Action: Register new user
-				uname := fmt.Sprintf("mixed_reg_%d", workerID)
-				body := fmt.Sprintf(`{"username": "%s", "password": "MixedPassword123!"}`, uname)
-				req := httptest.NewRequest(http.MethodPost, "/api/v1/register", strings.NewReader(body))
-				w := httptest.NewRecorder()
-				handler.HandleRegister(w, req)
-				if w.Result().StatusCode != http.StatusCreated {
-					t.Errorf("mixed reg failed for %s: %d", uname, w.Result().StatusCode)
-				}
-
-			case 1:
-				// Action: Login with preseeded user
-				uname := fmt.Sprintf("preseed_user_%d", workerID%20)
-				body := fmt.Sprintf(`{"username": "%s", "password": "PreseedPass123!"}`, uname)
-				req := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(body))
-				w := httptest.NewRecorder()
-				handler.HandleLogin(w, req)
-				if w.Result().StatusCode != http.StatusOK {
-					t.Errorf("mixed login failed for %s: %d", uname, w.Result().StatusCode)
-				}
-
-			case 2:
-				// Action: Login with wrong password (expect 401)
-				uname := fmt.Sprintf("preseed_user_%d", workerID%20)
-				body := fmt.Sprintf(`{"username": "%s", "password": "WrongPassword999!"}`, uname)
-				req := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(body))
-				w := httptest.NewRecorder()
-				handler.HandleLogin(w, req)
-				if w.Result().StatusCode != http.StatusUnauthorized {
-					t.Errorf("expected 401 for wrong pass, got %d", w.Result().StatusCode)
-				}
-
-			case 3:
-				// Action: Login with non-existent user (expect 401)
-				uname := fmt.Sprintf("ghost_worker_user_%d", workerID)
-				body := fmt.Sprintf(`{"username": "%s", "password": "Password123!"}`, uname)
-				req := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(body))
-				w := httptest.NewRecorder()
-				handler.HandleLogin(w, req)
-				if w.Result().StatusCode != http.StatusUnauthorized {
-					t.Errorf("expected 401 for ghost user, got %d", w.Result().StatusCode)
-				}
-
-			case 4:
-				// Action: Access protected endpoint with valid JWT token
-				token, _ := jwtMgr.GenerateToken(fmt.Sprintf("preseed_user_%d", workerID%20))
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
-				req.Header.Set("Authorization", "Bearer "+token)
-				w := httptest.NewRecorder()
-				protectedEndpoint.ServeHTTP(w, req)
-				if w.Result().StatusCode != http.StatusOK {
-					t.Errorf("expected 200 OK from protected endpoint, got %d", w.Result().StatusCode)
-				}
-
-			case 5:
-				// Action: Access protected endpoint with tampered token (expect 401)
-				token, _ := jwtMgr.GenerateToken("valid_user")
-				tamperedToken := token + "corrupted_sig"
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
-				req.Header.Set("Authorization", "Bearer "+tamperedToken)
-				w := httptest.NewRecorder()
-				protectedEndpoint.ServeHTTP(w, req)
-				if w.Result().StatusCode != http.StatusUnauthorized {
-					t.Errorf("expected 401 for tampered token, got %d", w.Result().StatusCode)
-				}
-
-			case 6:
-				// Action: Access protected endpoint with expired token (expect 401)
-				expiredMgr := auth.NewJWTManager("mixed-traffic-jwt-secret-key-32b", -5*time.Minute)
-				expiredToken, _ := expiredMgr.GenerateToken("expired_user")
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
-				req.Header.Set("Authorization", "Bearer "+expiredToken)
-				w := httptest.NewRecorder()
-				protectedEndpoint.ServeHTTP(w, req)
-				if w.Result().StatusCode != http.StatusUnauthorized {
-					t.Errorf("expected 401 for expired token, got %d", w.Result().StatusCode)
-				}
-
-			case 7:
-				// Action: Access protected endpoint with missing/malformed auth header (expect 401)
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
-				req.Header.Set("Authorization", "InvalidScheme xyz")
-				w := httptest.NewRecorder()
-				protectedEndpoint.ServeHTTP(w, req)
-				if w.Result().StatusCode != http.StatusUnauthorized {
-					t.Errorf("expected 401 for invalid scheme, got %d", w.Result().StatusCode)
-				}
-			}
+			runMixedTrafficWorker(t, workerID, handler, protectedEndpoint, jwtMgr)
 		}()
 	}
 	wg.Wait()

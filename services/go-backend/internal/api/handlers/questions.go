@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -62,26 +63,22 @@ type GenerateQuestionsResponse struct {
 }
 
 // HandleGenerateQuestions generates practice questions from document text.
-func (h *Handlers) HandleGenerateQuestions(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	userID := middleware.GetUserID(r.Context())
-
+func (h *Handlers) validateGenerateQuestionsRequest(w http.ResponseWriter, r *http.Request) (*GenerateQuestionsRequest, bool) {
 	var req GenerateQuestionsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if req.NumQuestions <= 0 && req.Count > 0 {
 		req.NumQuestions = req.Count
 	}
 	if req.DocID == "" {
 		jsonError(w, "doc_id is required", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if req.NumQuestions <= 0 {
 		req.NumQuestions = 5
-	}
-	if req.NumQuestions > 20 {
+	} else if req.NumQuestions > 20 {
 		req.NumQuestions = 20
 	}
 	if req.Difficulty <= 0 || req.Difficulty > 10 {
@@ -90,44 +87,45 @@ func (h *Handlers) HandleGenerateQuestions(w http.ResponseWriter, r *http.Reques
 	if req.QuestionType == "" {
 		req.QuestionType = "subjective"
 	}
+	return &req, true
+}
 
-	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("questions:%s:%d:%d:%s",
-		req.DocID, req.NumQuestions, req.Difficulty, req.QuestionType))))[:16]
-
-	cacheKey := fmt.Sprintf("questions:%s:%d:%d:%s", req.DocID, req.NumQuestions, req.Difficulty, req.QuestionType)
+func (h *Handlers) checkQuestionsCache(
+	ctx context.Context,
+	w http.ResponseWriter,
+	cacheKey, queryHash, userID, docID string,
+	start time.Time,
+) bool {
+	if h.Cache == nil {
+		return false
+	}
 	var cachedResponse GenerateQuestionsResponse
-	if found, err := h.Cache.Get(r.Context(), cacheKey, &cachedResponse); err == nil && found {
+	if found, err := h.Cache.Get(ctx, cacheKey, &cachedResponse); err == nil && found {
 		cachedResponse.CacheHit = true
 		cachedResponse.Latency = time.Since(start).String()
-		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "cache_hit")
+		if h.Audit != nil {
+			h.Audit.LogQuery(userID, docID, queryHash, time.Since(start), "cache_hit")
+		}
 		jsonResponse(w, cachedResponse)
-		return
+		return true
 	}
+	return false
+}
 
-	chunks, err := h.retrieveAllChunks(req.DocID)
-	if err != nil {
-		log.Printf("[GenerateQuestions] Retrieval failed: %v", err)
-		jsonError(w, "failed to retrieve document", http.StatusInternalServerError)
-		return
-	}
-	if len(chunks) == 0 {
-		jsonError(w, "document not found or empty", http.StatusNotFound)
-		return
-	}
-
-	contextText := strings.Join(chunks, "\n\n---\n\n")
-
+func buildQuestionsPrompt(contextText string, req *GenerateQuestionsRequest) string {
 	bloomClause := ""
 	if req.BloomLevel != "" {
 		bloomClause = fmt.Sprintf("\n- Target Bloom's taxonomy level: %s", req.BloomLevel)
 	}
 
 	questionTypeInstruction := "open-ended subjective questions requiring evidence-based reasoning"
+	optionsSchema := ""
 	if req.QuestionType == "mcq" {
 		questionTypeInstruction = "multiple-choice questions (MCQ) with exactly 4 options each (A, B, C, D) and indicate the correct answer"
+		optionsSchema = ",\n  \"options\": [\"A) ...\", \"B) ...\", \"C) ...\", \"D) ...\"]"
 	}
 
-	prompt := fmt.Sprintf(`You are an expert assessment designer. Based ONLY on the following document excerpts, generate practice questions.
+	return fmt.Sprintf(`You are an expert assessment designer. Based ONLY on the following document excerpts, generate practice questions.
 
 Document Excerpts:
 %s
@@ -148,47 +146,77 @@ Respond as a JSON array where each element has:
   "explanation": "Why this is the answer, citing the source material"%s
 }
 
-Respond ONLY with the JSON array.`, contextText, req.NumQuestions, questionTypeInstruction, req.Difficulty, bloomClause,
-		func() string {
-			if req.QuestionType == "mcq" {
-				return `,
-  "options": ["A) ...", "B) ...", "C) ...", "D) ..."]`
-			}
-			return ""
-		}())
+Respond ONLY with the JSON array.`, contextText, req.NumQuestions, questionTypeInstruction, req.Difficulty, bloomClause, optionsSchema)
+}
 
-	result, err := h.Council.Query(r.Context(), "questions:"+req.DocID, chunks, prompt, true, "council", nil)
-	if err != nil {
-		log.Printf("[GenerateQuestions] Council failed: %v", err)
-		jsonError(w, "question generation failed", http.StatusInternalServerError)
-		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "council_error")
-		return
-	}
-
+func parseQuestionsResponse(rawAnswer string, limit int) []GeneratedQuestion {
 	var questions []GeneratedQuestion
-	rawAnswer := result.FinalAnswer
-
 	jsonStr := extractQuestionsJSON(rawAnswer)
 	if err := json.Unmarshal([]byte(jsonStr), &questions); err != nil {
 		log.Printf("[GenerateQuestions] JSON parse failed, returning raw output: %v", err)
 	}
-	if len(questions) > req.NumQuestions {
-		questions = questions[:req.NumQuestions]
+	if len(questions) > limit {
+		questions = questions[:limit]
+	}
+	return questions
+}
+
+func (h *Handlers) HandleGenerateQuestions(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	userID := middleware.GetUserID(r.Context())
+
+	req, ok := h.validateGenerateQuestionsRequest(w, r)
+	if !ok {
+		return
 	}
 
+	cacheKey := fmt.Sprintf("questions:%s:%d:%d:%s", req.DocID, req.NumQuestions, req.Difficulty, req.QuestionType)
+	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte(cacheKey)))[:16]
+
+	if h.checkQuestionsCache(r.Context(), w, cacheKey, queryHash, userID, req.DocID, start) {
+		return
+	}
+
+	chunks, err := h.retrieveAllChunks(req.DocID)
+	if err != nil {
+		log.Printf("[GenerateQuestions] Retrieval failed: %v", err)
+		jsonError(w, "failed to retrieve document", http.StatusInternalServerError)
+		return
+	}
+	if len(chunks) == 0 {
+		jsonError(w, "document not found or empty", http.StatusNotFound)
+		return
+	}
+
+	prompt := buildQuestionsPrompt(strings.Join(chunks, "\n\n---\n\n"), req)
+	result, err := h.Council.Query(r.Context(), "questions:"+req.DocID, chunks, prompt, true, "council", nil)
+	if err != nil {
+		log.Printf("[GenerateQuestions] Council failed: %v", err)
+		jsonError(w, "question generation failed", http.StatusInternalServerError)
+		if h.Audit != nil {
+			h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "council_error")
+		}
+		return
+	}
+
+	questions := parseQuestionsResponse(result.FinalAnswer, req.NumQuestions)
 	response := GenerateQuestionsResponse{
 		Questions:  questions,
-		RawOutput:  rawAnswer,
+		RawOutput:  result.FinalAnswer,
 		Confidence: result.Confidence,
 		Source:     result.Source,
 		Latency:    time.Since(start).String(),
 		CacheHit:   false,
 	}
 
-	if err := h.Cache.Set(r.Context(), cacheKey, response); err != nil {
-		log.Printf("[GenerateQuestions] Cache set failed: %v", err)
+	if h.Cache != nil {
+		if err := h.Cache.Set(r.Context(), cacheKey, response); err != nil {
+			log.Printf("[GenerateQuestions] Cache set failed: %v", err)
+		}
 	}
 
-	h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "success")
+	if h.Audit != nil {
+		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "success")
+	}
 	jsonResponse(w, response)
 }

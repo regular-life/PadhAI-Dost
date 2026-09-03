@@ -174,10 +174,62 @@ type yamlSchema struct {
 }
 
 // Load reads config.yaml and overlays environment variables.
-func Load() *Config {
-	var y yamlSchema
+type serverSettings struct {
+	port        string
+	debug       bool
+	jwtSecret   string
+	jwtExp      time.Duration
+	rps         int
+	burst       int
+	cacheThresh float64
+	ragURL      string
+}
 
-	// Read config.yaml if available.
+type redisSettings struct {
+	addr            string
+	password        string
+	db              int
+	cbFailureThresh int
+	cbSuccessThresh int
+	cbTimeout       time.Duration
+}
+
+type databaseSettings struct {
+	url             string
+	host            string
+	port            string
+	user            string
+	password        string
+	name            string
+	sslMode         string
+	maxOpenConns    int
+	maxIdleConns    int
+	connMaxLifetime time.Duration
+	connMaxIdleTime time.Duration
+}
+
+type providerSettings struct {
+	openRouterURL string
+	openRouterKey string
+	nvidiaNIMURL  string
+	nvidiaNIMKey  string
+	vllmURL       string
+	geminiKey     string
+}
+
+type councilSettings struct {
+	size         int
+	slots        []ModelSlot
+	chairman     ModelSlot
+	router       ModelSlot
+	ingestion    ModelSlot
+	stageTimeout time.Duration
+	llmTimeout   time.Duration
+	reqTimeout   time.Duration
+}
+
+func loadYAML() yamlSchema {
+	var y yamlSchema
 	paths := []string{"/app/config.yaml", "config.yaml", "../config.yaml", "../../config.yaml"}
 	for _, p := range paths {
 		f, err := os.Open(p)
@@ -190,13 +242,14 @@ func Load() *Config {
 			_ = f.Close()
 		}
 	}
+	return y
+}
 
-	// 1. Core Server Configs.
+func loadServerSettings(y *yamlSchema) serverSettings {
 	port := getEnv("SERVER_PORT", y.Server.Port)
 	if port == "" {
 		port = "8080"
 	}
-	debug := getEnvBool("DEBUG", y.Server.Debug)
 	jwtSecret := getEnv("JWT_SECRET", y.Server.JWTSecret)
 	if jwtSecret == "" {
 		jwtSecret = "council-ai-secret-change-me"
@@ -219,19 +272,28 @@ func Load() *Config {
 	if cacheThresh <= 0 {
 		cacheThresh = 0.85
 	}
-
-	// 2. Peripheral Services.
 	ragURL := getEnv("RAG_SERVICE_URL", y.RAG.ServiceURL)
 	if ragURL == "" {
 		ragURL = "http://python-rag:8000"
 	}
-	redisAddr := getEnv("REDIS_ADDR", y.Redis.Addr)
-	if redisAddr == "" {
-		redisAddr = "redis:6379"
-	}
-	redisPwd := getEnv("REDIS_PASSWORD", y.Redis.Password)
-	redisDB := getEnvInt("REDIS_DB", y.Redis.DB)
 
+	return serverSettings{
+		port:        port,
+		debug:       getEnvBool("DEBUG", y.Server.Debug),
+		jwtSecret:   jwtSecret,
+		jwtExp:      jwtExp,
+		rps:         rps,
+		burst:       burst,
+		cacheThresh: cacheThresh,
+		ragURL:      ragURL,
+	}
+}
+
+func loadRedisSettings(y *yamlSchema) redisSettings {
+	addr := getEnv("REDIS_ADDR", y.Redis.Addr)
+	if addr == "" {
+		addr = "redis:6379"
+	}
 	cbFailureThresh := getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", y.Redis.FailureThreshold)
 	if cbFailureThresh <= 0 {
 		cbFailureThresh = 3
@@ -240,9 +302,17 @@ func Load() *Config {
 	if cbSuccessThresh <= 0 {
 		cbSuccessThresh = 2
 	}
-	cbTimeout := parseDuration(getEnv("CIRCUIT_BREAKER_TIMEOUT", y.Redis.Timeout), 10*time.Second)
+	return redisSettings{
+		addr:            addr,
+		password:        getEnv("REDIS_PASSWORD", y.Redis.Password),
+		db:              getEnvInt("REDIS_DB", y.Redis.DB),
+		cbFailureThresh: cbFailureThresh,
+		cbSuccessThresh: cbSuccessThresh,
+		cbTimeout:       parseDuration(getEnv("CIRCUIT_BREAKER_TIMEOUT", y.Redis.Timeout), 10*time.Second),
+	}
+}
 
-	// Database Settings
+func loadDatabaseSettings(y *yamlSchema) databaseSettings {
 	dbURL := getEnv("DATABASE_URL", y.Database.URL)
 	dbHost := getEnv("DB_HOST", y.Database.Host)
 	dbPort := getEnv("DB_PORT", y.Database.Port)
@@ -281,10 +351,23 @@ func Load() *Config {
 	if maxIdleConns <= 0 {
 		maxIdleConns = 5
 	}
-	connMaxLifetime := parseDuration(getEnv("DB_CONN_MAX_LIFETIME", y.Database.ConnMaxLifetime), 1*time.Hour)
-	connMaxIdleTime := parseDuration(getEnv("DB_CONN_MAX_IDLE_TIME", y.Database.ConnMaxIdleTime), 30*time.Minute)
 
-	// 3. Provider URLs & API Keys.
+	return databaseSettings{
+		url:             dbURL,
+		host:            dbHost,
+		port:            dbPort,
+		user:            dbUser,
+		password:        dbPass,
+		name:            dbName,
+		sslMode:         dbSSLMode,
+		maxOpenConns:    maxOpenConns,
+		maxIdleConns:    maxIdleConns,
+		connMaxLifetime: parseDuration(getEnv("DB_CONN_MAX_LIFETIME", y.Database.ConnMaxLifetime), 1*time.Hour),
+		connMaxIdleTime: parseDuration(getEnv("DB_CONN_MAX_IDLE_TIME", y.Database.ConnMaxIdleTime), 30*time.Minute),
+	}
+}
+
+func loadProviderSettings(y *yamlSchema) providerSettings {
 	orURL := getEnv("OPENROUTER_URL", y.Providers.OpenRouterURL)
 	if orURL == "" {
 		orURL = "https://openrouter.ai/api/v1/chat/completions"
@@ -298,11 +381,17 @@ func Load() *Config {
 		vllmURL = "http://vllm-inference:8001/v1/chat/completions"
 	}
 
-	geminiKey := getEnv("GEMINI_API_KEY", y.Keys.Gemini)
-	orKey := getEnv("OPENROUTER_API_KEY", y.Keys.OpenRouter)
-	nimKey := getEnv("NVIDIA_NIM_API_KEY", y.Keys.NVIDIANim)
+	return providerSettings{
+		openRouterURL: orURL,
+		openRouterKey: getEnv("OPENROUTER_API_KEY", y.Keys.OpenRouter),
+		nvidiaNIMURL:  nimURL,
+		nvidiaNIMKey:  getEnv("NVIDIA_NIM_API_KEY", y.Keys.NVIDIANim),
+		vllmURL:       vllmURL,
+		geminiKey:     getEnv("GEMINI_API_KEY", y.Keys.Gemini),
+	}
+}
 
-	// 4. Council Members and Core Roles.
+func loadCouncilSettings(y *yamlSchema) councilSettings {
 	cSize := getEnvInt("COUNCIL_SIZE", y.Council.Size)
 	if cSize <= 0 {
 		cSize = 3
@@ -354,15 +443,21 @@ func Load() *Config {
 		ingestionModel = "gemini-3-flash-preview"
 	}
 
-	// 5. Execution Timeouts.
-	stageTimeout := parseDuration(getEnv("STAGE_TIMEOUT", y.Council.Timeouts.Stage), 30*time.Second)
-	llmTimeout := parseDuration(getEnv("LLM_TIMEOUT", y.Council.Timeouts.LLM), 120*time.Second)
-	reqTimeout := parseDuration(getEnv("REQUEST_TIMEOUT", y.Council.Timeouts.Request), 120*time.Second)
+	return councilSettings{
+		size:         cSize,
+		slots:        slots,
+		chairman:     ModelSlot{Provider: chairmanProvider, Model: chairmanModel},
+		router:       ModelSlot{Provider: routerProvider, Model: routerModel},
+		ingestion:    ModelSlot{Provider: ingestionProvider, Model: ingestionModel},
+		stageTimeout: parseDuration(getEnv("STAGE_TIMEOUT", y.Council.Timeouts.Stage), 30*time.Second),
+		llmTimeout:   parseDuration(getEnv("LLM_TIMEOUT", y.Council.Timeouts.LLM), 120*time.Second),
+		reqTimeout:   parseDuration(getEnv("REQUEST_TIMEOUT", y.Council.Timeouts.Request), 120*time.Second),
+	}
+}
 
-	// 6. Local Inference (vLLM Engine Configs).
+func loadVLLMSettings(y *yamlSchema, slots []ModelSlot, chairmanProvider, routerProvider string) LocalModelConfig {
 	vllmEnabled := getEnvBool("VLLM_ENABLED", y.VLLM.Enabled)
 	if !vllmEnabled {
-		// Auto-enable if any council member, chairman, or router uses the "local" provider.
 		for _, slot := range slots {
 			if slot.Provider == "local" {
 				vllmEnabled = true
@@ -374,90 +469,98 @@ func Load() *Config {
 		}
 	}
 
-	vllmModelName := getEnv("VLLM_MODEL_NAME", y.VLLM.ModelName)
-	if vllmModelName == "" {
-		vllmModelName = "microsoft/Phi-4-mini-instruct"
+	modelName := getEnv("VLLM_MODEL_NAME", y.VLLM.ModelName)
+	if modelName == "" {
+		modelName = "microsoft/Phi-4-mini-instruct"
 	}
-	vllmDType := getEnv("VLLM_DTYPE", y.VLLM.DType)
-	vllmMaxLen := getEnvInt("VLLM_MAX_MODEL_LEN", y.VLLM.MaxModelLen)
-	if vllmMaxLen <= 0 {
-		vllmMaxLen = 4096
+	maxLen := getEnvInt("VLLM_MAX_MODEL_LEN", y.VLLM.MaxModelLen)
+	if maxLen <= 0 {
+		maxLen = 4096
 	}
-	vllmGPUUtil := getEnvFloat64("VLLM_GPU_MEMORY_UTIL", y.VLLM.GPUMemoryUtilization)
-	if vllmGPUUtil <= 0 {
-		vllmGPUUtil = 0.85
+	gpuUtil := getEnvFloat64("VLLM_GPU_MEMORY_UTIL", y.VLLM.GPUMemoryUtilization)
+	if gpuUtil <= 0 {
+		gpuUtil = 0.85
 	}
-	vllmQuant := getEnv("VLLM_QUANTIZATION", y.VLLM.Quantization)
-	vllmTP := getEnvInt("VLLM_TENSOR_PARALLEL", y.VLLM.TensorParallelSize)
-	if vllmTP <= 0 {
-		vllmTP = 1
+	tp := getEnvInt("VLLM_TENSOR_PARALLEL", y.VLLM.TensorParallelSize)
+	if tp <= 0 {
+		tp = 1
 	}
-	vllmSwap := getEnvInt("VLLM_SWAP_SPACE_GB", y.VLLM.SwapSpaceGB)
-	vllmMaxSeqs := getEnvInt("VLLM_MAX_NUM_SEQS", y.VLLM.MaxNumSeqs)
-	if vllmMaxSeqs <= 0 {
-		vllmMaxSeqs = 16
+	maxSeqs := getEnvInt("VLLM_MAX_NUM_SEQS", y.VLLM.MaxNumSeqs)
+	if maxSeqs <= 0 {
+		maxSeqs = 16
 	}
-	vllmKVDType := getEnv("VLLM_KV_CACHE_DTYPE", y.VLLM.KVCacheDType)
-	vllmCPUOffload := getEnvInt("VLLM_CPU_OFFLOAD_GB", y.VLLM.CPUOffloadGB)
+
+	return LocalModelConfig{
+		Enabled:              vllmEnabled,
+		ModelName:            modelName,
+		Quantization:         getEnv("VLLM_QUANTIZATION", y.VLLM.Quantization),
+		DType:                getEnv("VLLM_DTYPE", y.VLLM.DType),
+		GPUMemoryUtilization: gpuUtil,
+		MaxModelLen:          maxLen,
+		TensorParallelSize:   tp,
+		SwapSpaceGB:          getEnvInt("VLLM_SWAP_SPACE_GB", y.VLLM.SwapSpaceGB),
+		MaxNumSeqs:           maxSeqs,
+		KVCacheDType:         getEnv("VLLM_KV_CACHE_DTYPE", y.VLLM.KVCacheDType),
+		CPUOffloadGB:         getEnvInt("VLLM_CPU_OFFLOAD_GB", y.VLLM.CPUOffloadGB),
+	}
+}
+
+// Load reads and parses configuration from config.yaml and environment variables.
+func Load() *Config {
+	y := loadYAML()
+	srv := loadServerSettings(&y)
+	red := loadRedisSettings(&y)
+	db := loadDatabaseSettings(&y)
+	prov := loadProviderSettings(&y)
+	csl := loadCouncilSettings(&y)
+	vllm := loadVLLMSettings(&y, csl.slots, csl.chairman.Provider, csl.router.Provider)
 
 	return &Config{
-		ServerPort:                     port,
-		Debug:                          debug,
-		RAGServiceURL:                  ragURL,
-		RedisAddr:                      redisAddr,
-		RedisPassword:                  redisPwd,
-		RedisDB:                        redisDB,
-		CircuitBreakerFailureThreshold: cbFailureThresh,
-		CircuitBreakerSuccessThreshold: cbSuccessThresh,
-		CircuitBreakerTimeout:          cbTimeout,
-		JWTSecret:                      jwtSecret,
-		JWTExpiration:                  jwtExp,
-		RateLimitRPS:                   rps,
-		RateLimitBurst:                 burst,
+		ServerPort:                     srv.port,
+		Debug:                          srv.debug,
+		RAGServiceURL:                  srv.ragURL,
+		RedisAddr:                      red.addr,
+		RedisPassword:                  red.password,
+		RedisDB:                        red.db,
+		CircuitBreakerFailureThreshold: red.cbFailureThresh,
+		CircuitBreakerSuccessThreshold: red.cbSuccessThresh,
+		CircuitBreakerTimeout:          red.cbTimeout,
+		JWTSecret:                      srv.jwtSecret,
+		JWTExpiration:                  srv.jwtExp,
+		RateLimitRPS:                   srv.rps,
+		RateLimitBurst:                 srv.burst,
 
-		DatabaseURL:       dbURL,
-		DBHost:            dbHost,
-		DBPort:            dbPort,
-		DBUser:            dbUser,
-		DBPassword:        dbPass,
-		DBName:            dbName,
-		DBSSLMode:         dbSSLMode,
-		DBMaxOpenConns:    maxOpenConns,
-		DBMaxIdleConns:    maxIdleConns,
-		DBConnMaxLifetime: connMaxLifetime,
-		DBConnMaxIdleTime: connMaxIdleTime,
+		DatabaseURL:       db.url,
+		DBHost:            db.host,
+		DBPort:            db.port,
+		DBUser:            db.user,
+		DBPassword:        db.password,
+		DBName:            db.name,
+		DBSSLMode:         db.sslMode,
+		DBMaxOpenConns:    db.maxOpenConns,
+		DBMaxIdleConns:    db.maxIdleConns,
+		DBConnMaxLifetime: db.connMaxLifetime,
+		DBConnMaxIdleTime: db.connMaxIdleTime,
 
-		OpenRouterAPIKey: orKey,
-		OpenRouterURL:    orURL,
-		GeminiAPIKey:     geminiKey,
-		NVIDIANimAPIKey:  nimKey,
-		NVIDIANimURL:     nimURL,
+		OpenRouterAPIKey: prov.openRouterKey,
+		OpenRouterURL:    prov.openRouterURL,
+		GeminiAPIKey:     prov.geminiKey,
+		NVIDIANimAPIKey:  prov.nvidiaNIMKey,
+		NVIDIANimURL:     prov.nvidiaNIMURL,
 
-		VLLMURL: vllmURL,
-		VLLMConfig: LocalModelConfig{
-			Enabled:              vllmEnabled,
-			ModelName:            vllmModelName,
-			Quantization:         vllmQuant,
-			DType:                vllmDType,
-			GPUMemoryUtilization: vllmGPUUtil,
-			MaxModelLen:          vllmMaxLen,
-			TensorParallelSize:   vllmTP,
-			SwapSpaceGB:          vllmSwap,
-			MaxNumSeqs:           vllmMaxSeqs,
-			KVCacheDType:         vllmKVDType,
-			CPUOffloadGB:         vllmCPUOffload,
-		},
+		VLLMURL:    prov.vllmURL,
+		VLLMConfig: vllm,
 
-		CouncilSize:   cSize,
-		CouncilSlots:  slots,
-		ChairmanSlot:  ModelSlot{Provider: chairmanProvider, Model: chairmanModel},
-		RouterSlot:    ModelSlot{Provider: routerProvider, Model: routerModel},
-		IngestionSlot: ModelSlot{Provider: ingestionProvider, Model: ingestionModel},
+		CouncilSize:   csl.size,
+		CouncilSlots:  csl.slots,
+		ChairmanSlot:  csl.chairman,
+		RouterSlot:    csl.router,
+		IngestionSlot: csl.ingestion,
 
-		StageTimeout:           stageTimeout,
-		LLMTimeout:             llmTimeout,
-		RequestTimeout:         reqTimeout,
-		SemanticCacheThreshold: cacheThresh,
+		StageTimeout:           csl.stageTimeout,
+		LLMTimeout:             csl.llmTimeout,
+		RequestTimeout:         csl.reqTimeout,
+		SemanticCacheThreshold: srv.cacheThresh,
 	}
 }
 

@@ -35,6 +35,77 @@ func TestCircuitBreaker_InitialState(t *testing.T) {
 	}
 }
 
+func verifyLifecycleClosedPhases(t *testing.T, cb cache.CircuitBreaker, ctx context.Context) {
+	if cb.State() != cache.StateClosed || !cb.Allow() {
+		t.Fatalf("expected StateClosed and Allow() == true, got %s", cb.State())
+	}
+
+	for i := 0; i < 2; i++ {
+		err := cb.Execute(ctx, func() error { return errMockRedisDown })
+		if !errors.Is(err, errMockRedisDown) || cb.State() != cache.StateClosed {
+			t.Fatalf("expected errMockRedisDown and StateClosed at failure %d, got %v, %s", i+1, err, cb.State())
+		}
+	}
+
+	if err := cb.Execute(ctx, func() error { return nil }); err != nil || cb.State() != cache.StateClosed {
+		t.Fatalf("expected successful reset and StateClosed, got %v, %s", err, cb.State())
+	}
+	if _, failCount, _, _ := cb.Counts(); failCount != 0 {
+		t.Fatalf("expected consecutive failures reset to 0, got %d", failCount)
+	}
+}
+
+func verifyLifecycleOpenAndProbe(t *testing.T, cb cache.CircuitBreaker, ctx context.Context, setNow func(time.Duration)) {
+	for i := 0; i < 3; i++ {
+		_ = cb.Execute(ctx, func() error { return errMockRedisDown })
+	}
+	if cb.State() != cache.StateOpen {
+		t.Fatalf("expected StateOpen after 3 failures, got %s", cb.State())
+	}
+
+	invoked := false
+	err := cb.Execute(ctx, func() error {
+		invoked = true
+		return nil
+	})
+	if !errors.Is(err, cache.ErrCircuitOpen) || invoked || cb.Allow() {
+		t.Fatalf("expected ErrCircuitOpen, invoked=false, allow=false; got err=%v, invoked=%v", err, invoked)
+	}
+
+	setNow(150 * time.Millisecond)
+	if cb.State() != cache.StateHalfOpen {
+		t.Fatalf("expected StateHalfOpen after timeout, got %s", cb.State())
+	}
+
+	probeInvoked := false
+	err = cb.Execute(ctx, func() error {
+		probeInvoked = true
+		return nil
+	})
+	if err != nil || !probeInvoked || cb.State() != cache.StateHalfOpen {
+		t.Fatalf("unexpected probe behavior: err=%v, invoked=%v, state=%s", err, probeInvoked, cb.State())
+	}
+}
+
+func verifyLifecycleRecoveryAndProbeFailure(t *testing.T, cb cache.CircuitBreaker, ctx context.Context, setNow func(time.Duration)) {
+	if err := cb.Execute(ctx, func() error { return nil }); err != nil || cb.State() != cache.StateClosed {
+		t.Fatalf("expected StateClosed after 2nd success, got %v, %s", err, cb.State())
+	}
+
+	for i := 0; i < 3; i++ {
+		_ = cb.Execute(ctx, func() error { return errMockRedisDown })
+	}
+	if cb.State() != cache.StateOpen {
+		t.Fatalf("expected StateOpen, got %s", cb.State())
+	}
+
+	setNow(150 * time.Millisecond)
+	err := cb.Execute(ctx, func() error { return errMockRedisOOM })
+	if !errors.Is(err, errMockRedisOOM) || cb.State() != cache.StateOpen {
+		t.Fatalf("expected immediate transition back to StateOpen on probe failure, got %v, %s", err, cb.State())
+	}
+}
+
 func TestCircuitBreaker_StateTransitions_FullLifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -52,114 +123,9 @@ func TestCircuitBreaker_StateTransitions_FullLifecycle(t *testing.T) {
 	cb := cache.NewCircuitBreaker("test-breaker", cfg)
 	ctx := context.Background()
 
-	// 1. Initial State: Closed
-	if cb.State() != cache.StateClosed {
-		t.Fatalf("expected StateClosed, got %s", cb.State())
-	}
-	if !cb.Allow() {
-		t.Fatal("expected Allow() == true in Closed state")
-	}
-
-	// 2. Closed -> Closed (Sub-threshold failures)
-	for i := 0; i < 2; i++ {
-		err := cb.Execute(ctx, func() error { return errMockRedisDown })
-		if !errors.Is(err, errMockRedisDown) {
-			t.Fatalf("expected errMockRedisDown, got %v", err)
-		}
-		if cb.State() != cache.StateClosed {
-			t.Fatalf("expected StateClosed at failure %d, got %s", i+1, cb.State())
-		}
-	}
-
-	// Intermittent success resets failure count
-	err := cb.Execute(ctx, func() error { return nil })
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cb.State() != cache.StateClosed {
-		t.Fatalf("expected StateClosed, got %s", cb.State())
-	}
-	_, failCount, _, _ := cb.Counts()
-	if failCount != 0 {
-		t.Fatalf("expected consecutive failures reset to 0, got %d", failCount)
-	}
-
-	// 3. Closed -> Open (3 consecutive failures)
-	for i := 0; i < 3; i++ {
-		_ = cb.Execute(ctx, func() error { return errMockRedisDown })
-	}
-	if cb.State() != cache.StateOpen {
-		t.Fatalf("expected StateOpen after 3 failures, got %s", cb.State())
-	}
-
-	// 4. Open Fast-Fail (Within Timeout)
-	invoked := false
-	err = cb.Execute(ctx, func() error {
-		invoked = true
-		return nil
-	})
-	if !errors.Is(err, cache.ErrCircuitOpen) {
-		t.Fatalf("expected ErrCircuitOpen, got %v", err)
-	}
-	if invoked {
-		t.Fatal("expected closure NOT to be invoked in StateOpen")
-	}
-	if cb.Allow() {
-		t.Fatal("expected Allow() == false in StateOpen within timeout")
-	}
-
-	// 5. Open -> Half-Open (Advance mock time by 150ms past 100ms Timeout)
-	now = now.Add(150 * time.Millisecond)
-
-	if cb.State() != cache.StateHalfOpen {
-		t.Fatalf("expected StateHalfOpen after timeout elapsed, got %s", cb.State())
-	}
-
-	// Next call executes as probe
-	probeInvoked := false
-	err = cb.Execute(ctx, func() error {
-		probeInvoked = true
-		return nil // Probe 1 success
-	})
-	if err != nil {
-		t.Fatalf("unexpected probe error: %v", err)
-	}
-	if !probeInvoked {
-		t.Fatal("expected probe closure to be invoked")
-	}
-	if cb.State() != cache.StateHalfOpen {
-		t.Fatalf("expected StateHalfOpen during probing (1/2 successes), got %s", cb.State())
-	}
-
-	// 6. Half-Open -> Closed (2nd consecutive success reaches SuccessThreshold)
-	err = cb.Execute(ctx, func() error { return nil })
-	if err != nil {
-		t.Fatalf("unexpected second success error: %v", err)
-	}
-	if cb.State() != cache.StateClosed {
-		t.Fatalf("expected StateClosed after reaching success threshold, got %s", cb.State())
-	}
-
-	// 7. Half-Open -> Open (Probe Failure)
-	// Trip to Open again
-	for i := 0; i < 3; i++ {
-		_ = cb.Execute(ctx, func() error { return errMockRedisDown })
-	}
-	if cb.State() != cache.StateOpen {
-		t.Fatalf("expected StateOpen, got %s", cb.State())
-	}
-
-	// Advance time past Timeout to enter Half-Open
-	now = now.Add(150 * time.Millisecond)
-
-	// Probe fails -> must immediately trip back to StateOpen
-	err = cb.Execute(ctx, func() error { return errMockRedisOOM })
-	if !errors.Is(err, errMockRedisOOM) {
-		t.Fatalf("expected errMockRedisOOM, got %v", err)
-	}
-	if cb.State() != cache.StateOpen {
-		t.Fatalf("expected immediate transition back to StateOpen on probe failure, got %s", cb.State())
-	}
+	verifyLifecycleClosedPhases(t, cb, ctx)
+	verifyLifecycleOpenAndProbe(t, cb, ctx, func(d time.Duration) { now = now.Add(d) })
+	verifyLifecycleRecoveryAndProbeFailure(t, cb, ctx, func(d time.Duration) { now = now.Add(d) })
 }
 
 func TestCircuitBreaker_HalfOpen_MaxCallsLimiting(t *testing.T) {
@@ -401,6 +367,70 @@ func TestCircuitBreaker_HighConcurrency_200Goroutines(t *testing.T) {
 
 // TestAdversarial_StateTransitions_ClosedOpenHalfOpenClosed rigorously verifies
 // the complete state transition cycle: Closed -> Open -> HalfOpen -> Closed.
+func verifyAdversarialSubThresholdFailures(t *testing.T, cb cache.CircuitBreaker, ctx context.Context, dummyErr error) {
+	if cb.State() != cache.StateClosed {
+		t.Fatalf("expected initial StateClosed, got %s", cb.State())
+	}
+
+	for i := 1; i <= 4; i++ {
+		err := cb.Execute(ctx, func() error { return dummyErr })
+		if !errors.Is(err, dummyErr) || cb.State() != cache.StateClosed {
+			t.Fatalf("failure %d: expected dummyErr and StateClosed, got %v, %s", i, err, cb.State())
+		}
+		_, fails, _, totFails := cb.Counts()
+		if fails != i || totFails != uint64(i) {
+			t.Fatalf("expected consecutive fails=%d, totFails=%d; got %d, %d", i, i, fails, totFails)
+		}
+	}
+
+	if err := cb.Execute(ctx, func() error { return nil }); err != nil || cb.State() != cache.StateClosed {
+		t.Fatalf("expected successful reset and StateClosed, got %v, %s", err, cb.State())
+	}
+	if _, fails, _, _ := cb.Counts(); fails != 0 {
+		t.Fatalf("expected consecutive failures reset to 0 after success, got %d", fails)
+	}
+}
+
+func verifyAdversarialOpenAndFastFail(t *testing.T, cb cache.CircuitBreaker, ctx context.Context, dummyErr error) {
+	for i := 1; i <= 5; i++ {
+		_ = cb.Execute(ctx, func() error { return dummyErr })
+	}
+	if cb.State() != cache.StateOpen {
+		t.Fatalf("expected StateOpen after 5 consecutive failures, got %s", cb.State())
+	}
+
+	opExecuted := false
+	err := cb.Execute(ctx, func() error {
+		opExecuted = true
+		return nil
+	})
+	if !errors.Is(err, cache.ErrCircuitOpen) || opExecuted {
+		t.Fatalf("expected ErrCircuitOpen and opExecuted=false, got err=%v, executed=%v", err, opExecuted)
+	}
+}
+
+func verifyAdversarialHalfOpenConvergence(t *testing.T, cb cache.CircuitBreaker, ctx context.Context, advanceClock func(time.Duration)) {
+	advanceClock(600 * time.Millisecond)
+	if cb.State() != cache.StateHalfOpen {
+		t.Fatalf("expected StateHalfOpen after timeout elapsed, got %s", cb.State())
+	}
+
+	for i := 1; i <= 2; i++ {
+		probeCalled := false
+		err := cb.Execute(ctx, func() error {
+			probeCalled = true
+			return nil
+		})
+		if err != nil || !probeCalled || cb.State() != cache.StateHalfOpen {
+			t.Fatalf("probe %d failed: err=%v, called=%v, state=%s", i, err, probeCalled, cb.State())
+		}
+	}
+
+	if err := cb.Execute(ctx, func() error { return nil }); err != nil || cb.State() != cache.StateClosed {
+		t.Fatalf("expected StateClosed after 3 probe successes, got err=%v, state=%s", err, cb.State())
+	}
+}
+
 func TestAdversarial_StateTransitions_ClosedOpenHalfOpenClosed(t *testing.T) {
 	t.Parallel()
 
@@ -416,94 +446,11 @@ func TestAdversarial_StateTransitions_ClosedOpenHalfOpenClosed(t *testing.T) {
 	}
 	cb := cache.NewCircuitBreaker("adv-transition-test", cfg)
 	ctx := context.Background()
-
-	// 1. Initial State: Must be Closed
-	if cb.State() != cache.StateClosed {
-		t.Fatalf("expected initial StateClosed, got %s", cb.State())
-	}
-
-	// 2. Sub-threshold failures (4 failures < FailureThreshold 5)
 	dummyErr := errors.New("simulated redis timeout")
-	for i := 1; i <= 4; i++ {
-		err := cb.Execute(ctx, func() error { return dummyErr })
-		if !errors.Is(err, dummyErr) {
-			t.Fatalf("expected dummyErr, got %v", err)
-		}
-		if cb.State() != cache.StateClosed {
-			t.Fatalf("at failure %d: expected StateClosed, got %s", i, cb.State())
-		}
-		_, fails, _, totFails := cb.Counts()
-		if fails != i || totFails != uint64(i) {
-			t.Fatalf("expected consecutive fails=%d, totFails=%d; got %d, %d", i, i, fails, totFails)
-		}
-	}
 
-	// 3. Success resets consecutive failures to 0
-	err := cb.Execute(ctx, func() error { return nil })
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	_, fails, _, _ := cb.Counts()
-	if fails != 0 {
-		t.Fatalf("expected consecutive failures reset to 0 after success, got %d", fails)
-	}
-	if cb.State() != cache.StateClosed {
-		t.Fatalf("expected StateClosed after success, got %s", cb.State())
-	}
-
-	// 4. Exactly 5 consecutive failures trip to StateOpen
-	for i := 1; i <= 5; i++ {
-		_ = cb.Execute(ctx, func() error { return dummyErr })
-	}
-	if cb.State() != cache.StateOpen {
-		t.Fatalf("expected StateOpen after 5 consecutive failures, got %s", cb.State())
-	}
-
-	// 5. While Open and before timeout: must fast-fail with ErrCircuitOpen without executing op
-	opExecuted := false
-	err = cb.Execute(ctx, func() error {
-		opExecuted = true
-		return nil
-	})
-	if !errors.Is(err, cache.ErrCircuitOpen) {
-		t.Fatalf("expected ErrCircuitOpen, got %v", err)
-	}
-	if opExecuted {
-		t.Fatal("op() was executed when circuit was Open!")
-	}
-
-	// 6. Advance virtual clock past timeout (600ms > 500ms) -> transitions to HalfOpen
-	virtualTime = virtualTime.Add(600 * time.Millisecond)
-	if cb.State() != cache.StateHalfOpen {
-		t.Fatalf("expected StateHalfOpen after timeout elapsed, got %s", cb.State())
-	}
-
-	// 7. In HalfOpen, exactly 3 consecutive successes are required to transition to Closed
-	for i := 1; i <= 2; i++ {
-		probeCalled := false
-		err = cb.Execute(ctx, func() error {
-			probeCalled = true
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("probe %d failed: %v", i, err)
-		}
-		if !probeCalled {
-			t.Fatalf("probe %d op was not executed", i)
-		}
-		if cb.State() != cache.StateHalfOpen {
-			t.Fatalf("expected StateHalfOpen during probe %d (need 3 successes), got %s", i, cb.State())
-		}
-	}
-
-	// 3rd success transitions to Closed
-	err = cb.Execute(ctx, func() error { return nil })
-	if err != nil {
-		t.Fatalf("final probe failed: %v", err)
-	}
-	if cb.State() != cache.StateClosed {
-		t.Fatalf("expected StateClosed after 3 probe successes, got %s", cb.State())
-	}
+	verifyAdversarialSubThresholdFailures(t, cb, ctx, dummyErr)
+	verifyAdversarialOpenAndFastFail(t, cb, ctx, dummyErr)
+	verifyAdversarialHalfOpenConvergence(t, cb, ctx, func(d time.Duration) { virtualTime = virtualTime.Add(d) })
 }
 
 // TestAdversarial_StateTransitions_HalfOpenToOpen verifies that ANY probe failure

@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
@@ -13,47 +15,72 @@ import (
 )
 
 // HandleIngest passes uploaded documents to the Python RAG service.
-func (h *Handlers) HandleIngest(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	userID := middleware.GetUserID(r.Context())
-
+func prepareIngestMultipart(r *http.Request) (multipart.File, *bytes.Buffer, string, string, int, error) {
 	if err := r.ParseMultipartForm(50 << 20); err != nil {
-		jsonError(w, "failed to parse form data", http.StatusBadRequest)
-		return
+		return nil, nil, "", "", http.StatusBadRequest, fmt.Errorf("failed to parse form data: %w", err)
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		jsonError(w, "file is required", http.StatusBadRequest)
-		return
+		return nil, nil, "", "", http.StatusBadRequest, fmt.Errorf("file is required: %w", err)
 	}
-	defer file.Close()
 
 	docID := r.FormValue("doc_id")
-
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	part, err := writer.CreateFormFile("file", header.Filename)
 	if err != nil {
-		jsonError(w, "failed to create form file", http.StatusInternalServerError)
-		return
+		file.Close()
+		return nil, nil, "", "", http.StatusInternalServerError, fmt.Errorf("failed to create form file: %w", err)
 	}
 	if _, err := io.Copy(part, file); err != nil {
-		jsonError(w, "failed to copy file", http.StatusInternalServerError)
-		return
+		file.Close()
+		return nil, nil, "", "", http.StatusInternalServerError, fmt.Errorf("failed to copy file: %w", err)
 	}
 	if docID != "" {
 		_ = writer.WriteField("doc_id", docID)
 	}
 	writer.Close()
 
-	httpReq, err := http.NewRequestWithContext(r.Context(), "POST", h.RAGServiceURL+"/ingest", &buf)
+	return file, &buf, writer.FormDataContentType(), docID, http.StatusOK, nil
+}
+
+func (h *Handlers) summarizeAndCacheIngestDoc(ctx context.Context, previewText, docID string) {
+	if previewText == "" || docID == "" || h.IngestAgent == nil {
+		return
+	}
+	summary, err := h.IngestAgent.SummarizeDocument(ctx, previewText)
+	if err != nil || summary == "" {
+		log.Printf("[Ingest] Summarization failed for doc %s: %v", docID, err)
+		return
+	}
+	if h.Cache != nil {
+		if err := h.Cache.Set(ctx, "doc_summary:"+docID, summary); err != nil {
+			log.Printf("[Ingest] Failed to cache summary for doc %s: %v", docID, err)
+		} else {
+			log.Printf("[Ingest] Generated and cached summary for doc %s", docID)
+		}
+	}
+}
+
+func (h *Handlers) HandleIngest(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	userID := middleware.GetUserID(r.Context())
+
+	file, buf, contentType, docID, status, err := prepareIngestMultipart(r)
+	if err != nil {
+		jsonError(w, err.Error(), status)
+		return
+	}
+	defer file.Close()
+
+	httpReq, err := http.NewRequestWithContext(r.Context(), "POST", h.RAGServiceURL+"/ingest", buf)
 	if err != nil {
 		log.Printf("[Ingest] Failed to create request: %v", err)
 		jsonError(w, "failed to create request", http.StatusInternalServerError)
 		return
 	}
-	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
+	httpReq.Header.Set("Content-Type", contentType)
 	if h.Tracer != nil {
 		h.Tracer.InjectHTTPHeaders(r.Context(), httpReq)
 	}
@@ -81,20 +108,10 @@ func (h *Handlers) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		docID = parsedResp.DocID
 	}
 
-	if parsedResp.PreviewText != "" && docID != "" {
-		summary, err := h.IngestAgent.SummarizeDocument(r.Context(), parsedResp.PreviewText)
-		if err == nil && summary != "" {
-			if err := h.Cache.Set(r.Context(), "doc_summary:"+docID, summary); err != nil {
-				log.Printf("[Ingest] Failed to cache summary for doc %s: %v", docID, err)
-			} else {
-				log.Printf("[Ingest] Generated and cached summary for doc %s", docID)
-			}
-		} else {
-			log.Printf("[Ingest] Summarization failed for doc %s: %v", docID, err)
-		}
+	h.summarizeAndCacheIngestDoc(r.Context(), parsedResp.PreviewText, docID)
+	if h.Audit != nil {
+		h.Audit.LogIngest(userID, docID, time.Since(start), "success")
 	}
-
-	h.Audit.LogIngest(userID, docID, time.Since(start), "success")
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)

@@ -25,12 +25,70 @@ import (
 // Empirical Challenge 1: Fast vs Slow Model Differential Latency & TTFT Stress
 // ─────────────────────────────────────────────────────────────────────────────
 
+func verifyDifferentialFirstDraft(t *testing.T, w *StreamingRecorder, start time.Time) {
+	select {
+	case <-w.FlushChan:
+		ttft := time.Since(start)
+		t.Logf("Empirical TTFT measurement: %v", ttft)
+		if ttft >= 1500*time.Millisecond {
+			t.Fatalf("TTFT VIOLATION: First candidate took %v (expected < 1500ms)", ttft)
+		}
+
+		events := parseSSEEvents(w.BodyString())
+		if len(events) == 0 {
+			t.Fatalf("no SSE events received on first draft flush")
+		}
+		if events[0].Event != "candidate_draft" {
+			t.Fatalf("expected first event to be candidate_draft, got %s", events[0].Event)
+		}
+
+		var payload council.CandidateDraftPayload
+		if err := json.Unmarshal([]byte(events[0].Data), &payload); err != nil {
+			t.Fatalf("failed to decode candidate draft payload: %v", err)
+		}
+		if payload.Model != "mock:ultra-fast" && payload.ModelName != "mock:ultra-fast" {
+			t.Fatalf("expected first draft from mock:ultra-fast, got %s / %s", payload.Model, payload.ModelName)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first candidate draft")
+	}
+}
+
+func verifyDifferentialFullDeliberation(t *testing.T, w *StreamingRecorder, done <-chan struct{}, start time.Time) {
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("full deliberation exceeded 5s timeout")
+	}
+
+	t.Logf("Full deliberation completed in: %v", time.Since(start))
+
+	allEvents := parseSSEEvents(w.BodyString())
+	drafts, reviews, finals := 0, 0, 0
+
+	for _, ev := range allEvents {
+		switch ev.Event {
+		case "candidate_draft":
+			drafts++
+		case "peer_review":
+			reviews++
+		case "final_answer":
+			finals++
+		}
+	}
+
+	if drafts != 3 {
+		t.Errorf("expected 3 drafts, got %d", drafts)
+	}
+	if reviews != 3 {
+		t.Errorf("expected 3 reviews, got %d", reviews)
+	}
+	if finals != 1 {
+		t.Errorf("expected 1 final answer, got %d", finals)
+	}
+}
+
 func TestEmpirical_TTFT_DifferentialLatency(t *testing.T) {
-	// Simulate 3 council models with extreme latency disparity:
-	// - Ultra-fast model: 15ms
-	// - Medium model: 400ms
-	// - Slow model: 1200ms
-	// Chairman: 50ms
 	fastClient := &handlerMockLLMClient{
 		Name:  "mock:ultra-fast",
 		Delay: 15 * time.Millisecond,
@@ -78,7 +136,6 @@ func TestEmpirical_TTFT_DifferentialLatency(t *testing.T) {
 	req.Header.Set("Accept", "text/event-stream")
 
 	w := NewStreamingRecorder()
-
 	start := time.Now()
 	done := make(chan struct{})
 	go func() {
@@ -86,79 +143,14 @@ func TestEmpirical_TTFT_DifferentialLatency(t *testing.T) {
 		close(done)
 	}()
 
-	// 1. Initial Flush: Headers (200 OK)
 	select {
 	case <-w.FlushChan:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for HTTP response headers")
 	}
 
-	// 2. Second Flush: First candidate draft (must be from ultra-fast model and < 1.5s)
-	select {
-	case <-w.FlushChan:
-		ttft := time.Since(start)
-		t.Logf("Empirical TTFT measurement: %v", ttft)
-		if ttft >= 1500*time.Millisecond {
-			t.Fatalf("TTFT VIOLATION: First candidate took %v (expected < 1500ms)", ttft)
-		}
-		if ttft > 300*time.Millisecond {
-			t.Errorf("TTFT slower than expected for 15ms mock: %v", ttft)
-		}
-
-		events := parseSSEEvents(w.Body.String())
-		if len(events) == 0 {
-			t.Fatalf("no SSE events received on first draft flush")
-		}
-		if events[0].Event != "candidate_draft" {
-			t.Fatalf("expected first event to be candidate_draft, got %s", events[0].Event)
-		}
-
-		var payload council.CandidateDraftPayload
-		if err := json.Unmarshal([]byte(events[0].Data), &payload); err != nil {
-			t.Fatalf("failed to decode candidate draft payload: %v", err)
-		}
-		if payload.Model != "mock:ultra-fast" && payload.ModelName != "mock:ultra-fast" {
-			t.Fatalf("expected first draft from mock:ultra-fast, got %s / %s", payload.Model, payload.ModelName)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first candidate draft")
-	}
-
-	// Wait for full deliberation stream to complete
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("full deliberation exceeded 5s timeout")
-	}
-
-	totalDuration := time.Since(start)
-	t.Logf("Full deliberation completed in: %v", totalDuration)
-
-	allEvents := parseSSEEvents(w.Body.String())
-	drafts := 0
-	reviews := 0
-	finals := 0
-
-	for _, ev := range allEvents {
-		switch ev.Event {
-		case "candidate_draft":
-			drafts++
-		case "peer_review":
-			reviews++
-		case "final_answer":
-			finals++
-		}
-	}
-
-	if drafts != 3 {
-		t.Errorf("expected 3 drafts, got %d", drafts)
-	}
-	if reviews != 3 {
-		t.Errorf("expected 3 reviews, got %d", reviews)
-	}
-	if finals != 1 {
-		t.Errorf("expected 1 final answer, got %d", finals)
-	}
+	verifyDifferentialFirstDraft(t, w, start)
+	verifyDifferentialFullDeliberation(t, w, done, start)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,11 +400,7 @@ func TestEmpirical_StrictSSEFramingValidation(t *testing.T) {
 // Empirical Challenge 4: Dual-Alias Field Compatibility & JSON Serialization
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestEmpirical_DualAliasCompatibility(t *testing.T) {
-	// Test CandidateDraftPayload dual alias serialization & deserialization
-	draftJSON := `{"index":0,"model":"claude-3.5-sonnet","model_name":"claude-3.5-sonnet","answer":"Draft 1","content":"Draft 1","latency_ms":42}`
-
-	// Deserialization check 1: Standard struct
+func verifyCandidateDraftDualAliases(t *testing.T, draftJSON string) {
 	var draft council.CandidateDraftPayload
 	if err := json.Unmarshal([]byte(draftJSON), &draft); err != nil {
 		t.Fatalf("failed to unmarshal CandidateDraftPayload: %v", err)
@@ -424,34 +412,27 @@ func TestEmpirical_DualAliasCompatibility(t *testing.T) {
 		t.Errorf("mismatched answer/content aliases: Answer=%q, Content=%q", draft.Answer, draft.Content)
 	}
 
-	// Deserialization check 2: Legacy client struct expecting only `model` and `answer`
 	type LegacyCandidateDraft struct {
 		Model  string `json:"model"`
 		Answer string `json:"answer"`
 	}
 	var legacyDraft LegacyCandidateDraft
-	if err := json.Unmarshal([]byte(draftJSON), &legacyDraft); err != nil {
-		t.Fatalf("legacy client failed to unmarshal: %v", err)
-	}
-	if legacyDraft.Model != "claude-3.5-sonnet" || legacyDraft.Answer != "Draft 1" {
-		t.Errorf("legacy client field mismatch: %+v", legacyDraft)
+	if err := json.Unmarshal([]byte(draftJSON), &legacyDraft); err != nil || legacyDraft.Model != "claude-3.5-sonnet" || legacyDraft.Answer != "Draft 1" {
+		t.Errorf("legacy client mismatch: %+v, err: %v", legacyDraft, err)
 	}
 
-	// Deserialization check 3: Modern client struct expecting `model_name` and `content`
 	type ModernCandidateDraft struct {
 		ModelName string `json:"model_name"`
 		Content   string `json:"content"`
 		LatencyMs int64  `json:"latency_ms"`
 	}
 	var modernDraft ModernCandidateDraft
-	if err := json.Unmarshal([]byte(draftJSON), &modernDraft); err != nil {
-		t.Fatalf("modern client failed to unmarshal: %v", err)
+	if err := json.Unmarshal([]byte(draftJSON), &modernDraft); err != nil || modernDraft.ModelName != "claude-3.5-sonnet" || modernDraft.Content != "Draft 1" || modernDraft.LatencyMs != 42 {
+		t.Errorf("modern client mismatch: %+v, err: %v", modernDraft, err)
 	}
-	if modernDraft.ModelName != "claude-3.5-sonnet" || modernDraft.Content != "Draft 1" || modernDraft.LatencyMs != 42 {
-		t.Errorf("modern client field mismatch: %+v", modernDraft)
-	}
+}
 
-	// Test CouncilResult dual alias serialization for candidates list
+func verifyCouncilResultDualAliases(t *testing.T) {
 	result := council.CouncilResult{
 		FinalAnswer: "Synthesized consensus",
 		Answer:      "Synthesized consensus",
@@ -478,6 +459,12 @@ func TestEmpirical_DualAliasCompatibility(t *testing.T) {
 	if resMap["final_answer"] == nil || resMap["answer"] == nil {
 		t.Errorf("CouncilResult JSON missing final_answer or answer field: %s", string(resBytes))
 	}
+}
+
+func TestEmpirical_DualAliasCompatibility(t *testing.T) {
+	draftJSON := `{"index":0,"model":"claude-3.5-sonnet","model_name":"claude-3.5-sonnet","answer":"Draft 1","content":"Draft 1","latency_ms":42}`
+	verifyCandidateDraftDualAliases(t, draftJSON)
+	verifyCouncilResultDualAliases(t)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -877,19 +864,20 @@ func TestEmpirical_Scenario2_SlowClientConsumer_NoDeadlock(t *testing.T) {
 		t.Fatalf("expected HTTP 200 OK, got %d", resp.StatusCode)
 	}
 
-	// Wrap body in slow reader: 20ms delay per 32-byte read
 	slowBody := &slowReaderBody{
 		ReadCloser:    resp.Body,
 		delayPerChunk: 20 * time.Millisecond,
 		chunkSize:     32,
 	}
 
-	scanner := bufio.NewScanner(slowBody)
+	events := readSlowConsumerSSEEvents(t, slowBody)
+	verifySlowConsumerDeliberationEvents(t, events)
+}
+
+func readSlowConsumerSSEEvents(t *testing.T, r io.Reader) []ParsedSSEEvent {
+	scanner := bufio.NewScanner(r)
 	var events []ParsedSSEEvent
-	var (
-		curEvent string
-		curData  string
-	)
+	var curEvent, curData string
 
 	startRead := time.Now()
 	for scanner.Scan() {
@@ -897,8 +885,7 @@ func TestEmpirical_Scenario2_SlowClientConsumer_NoDeadlock(t *testing.T) {
 		if line == "" {
 			if curEvent != "" || curData != "" {
 				events = append(events, ParsedSSEEvent{Event: curEvent, Data: curData})
-				curEvent = ""
-				curData = ""
+				curEvent, curData = "", ""
 			}
 			continue
 		}
@@ -913,18 +900,16 @@ func TestEmpirical_Scenario2_SlowClientConsumer_NoDeadlock(t *testing.T) {
 		t.Fatalf("scanner error during slow consumer read: %v", err)
 	}
 
-	duration := time.Since(startRead)
-	t.Logf("Slow consumer read completed in %v, received %d SSE events", duration, len(events))
+	t.Logf("Slow consumer read completed in %v, received %d SSE events", time.Since(startRead), len(events))
+	return events
+}
 
-	// Expected events: 2 candidate_draft + 2 peer_review + 1 final_answer = 5 events
+func verifySlowConsumerDeliberationEvents(t *testing.T, events []ParsedSSEEvent) {
 	if len(events) != 5 {
 		t.Fatalf("expected 5 SSE events, got %d", len(events))
 	}
 
-	draftCount := 0
-	reviewCount := 0
-	finalFound := false
-
+	draftCount, reviewCount, finalFound := 0, 0, false
 	for _, ev := range events {
 		switch ev.Event {
 		case "candidate_draft":
@@ -958,251 +943,256 @@ func TestEmpirical_Scenario2_SlowClientConsumer_NoDeadlock(t *testing.T) {
 // Scenario 3: Partial Model Failure During Deliberation (1 of 3, 2 of 3, etc.)
 // ─────────────────────────────────────────────────────────────────────────────
 
+func testScenario3A_OneModelFails(t *testing.T) {
+	clientGood1 := &handlerMockLLMClient{
+		Name: "mock:good-1",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "Good 1 draft", Model: "mock:good-1"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return &llm.Response{Answer: "RANKING: A, B\nREASONING: Good 1 review", Model: "mock:good-1"}, nil
+		},
+	}
+	clientFailing := &handlerMockLLMClient{
+		Name: "mock:failing-model",
+		Fail: true,
+	}
+	clientGood2 := &handlerMockLLMClient{
+		Name: "mock:good-2",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "Good 2 draft", Model: "mock:good-2"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return &llm.Response{Answer: "RANKING: B, A\nREASONING: Good 2 review", Model: "mock:good-2"}, nil
+		},
+	}
+	chairman := &handlerMockLLMClient{
+		Name: "mock:chairman",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{
+				Answer: `{"answer":"Synthesized answer from 2 remaining healthy models","confidence":0.88,"source":"mock:chairman"}`,
+				Model:  "mock:chairman",
+			}, nil
+		},
+	}
+
+	h := setupTestHandlersWithCouncil(t, []llm.LLMClient{clientGood1, clientFailing, clientGood2}, chairman)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Partial failure 1 of 3 test"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := httptest.NewRecorder()
+	h.HandleQuery(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	if len(events) == 0 {
+		t.Fatalf("no SSE events received: %s", w.Body.String())
+	}
+
+	var errorDraftFound, finalAnswerFound bool
+	var validDraftCount int
+
+	for _, ev := range events {
+		if ev.Event == "candidate_draft" {
+			var draft council.CandidateDraftPayload
+			if err := json.Unmarshal([]byte(ev.Data), &draft); err != nil {
+				t.Fatalf("failed to decode draft: %v", err)
+			}
+			if draft.Error != "" {
+				errorDraftFound = true
+				if draft.Model != "mock:failing-model" {
+					t.Errorf("expected failing model to be mock:failing-model, got %s", draft.Model)
+				}
+			} else {
+				validDraftCount++
+			}
+		}
+		if ev.Event == "final_answer" {
+			finalAnswerFound = true
+			var res QueryResponse
+			if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
+				t.Fatalf("failed to unmarshal final answer: %v", err)
+			}
+			if res.Answer != "Synthesized answer from 2 remaining healthy models" {
+				t.Errorf("unexpected final answer: %s", res.Answer)
+			}
+			if res.Confidence != 0.88 {
+				t.Errorf("expected confidence 0.88, got %f", res.Confidence)
+			}
+		}
+	}
+
+	if !errorDraftFound {
+		t.Errorf("expected an error candidate_draft event for failing model")
+	}
+	if validDraftCount != 2 {
+		t.Errorf("expected 2 valid candidate drafts, got %d", validDraftCount)
+	}
+	if !finalAnswerFound {
+		t.Errorf("expected final_answer event to be emitted successfully despite 1 model failure")
+	}
+}
+
+func testScenario3B_TwoModelsFail(t *testing.T) {
+	clientFail1 := &handlerMockLLMClient{Name: "mock:fail-1", Fail: true}
+	clientGood := &handlerMockLLMClient{
+		Name: "mock:only-survivor",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "Survivor response", Model: "mock:only-survivor"}, nil
+		},
+	}
+	clientFail2 := &handlerMockLLMClient{Name: "mock:fail-2", Fail: true}
+
+	h := setupTestHandlersWithCouncil(t, []llm.LLMClient{clientFail1, clientGood, clientFail2}, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "2 of 3 fail test"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := httptest.NewRecorder()
+	h.HandleQuery(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	var finalAnswerFound bool
+	var peerReviewCount int
+
+	for _, ev := range events {
+		if ev.Event == "peer_review" {
+			peerReviewCount++
+		}
+		if ev.Event == "final_answer" {
+			finalAnswerFound = true
+			var res QueryResponse
+			if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
+				t.Fatalf("failed to unmarshal final answer: %v", err)
+			}
+			if res.Answer != "Survivor response" {
+				t.Errorf("expected survivor response, got: %s", res.Answer)
+			}
+			if !strings.Contains(res.Source, "single-response") {
+				t.Errorf("expected source to indicate single-response, got: %s", res.Source)
+			}
+		}
+	}
+
+	if peerReviewCount > 0 {
+		t.Errorf("peer review should be skipped when only 1 model succeeds, but got %d reviews", peerReviewCount)
+	}
+	if !finalAnswerFound {
+		t.Errorf("final_answer event was not emitted for single model fallback")
+	}
+}
+
+func testScenario3C_PeerReviewFails(t *testing.T) {
+	client1 := &handlerMockLLMClient{
+		Name: "mock:cand-1",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "Short candidate answer", Model: "mock:cand-1"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return nil, context.DeadlineExceeded
+		},
+	}
+	client2 := &handlerMockLLMClient{
+		Name: "mock:cand-2",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "Longer comprehensive candidate answer", Model: "mock:cand-2"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return nil, context.DeadlineExceeded
+		},
+	}
+
+	h := setupTestHandlersWithCouncil(t, []llm.LLMClient{client1, client2}, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Peer review fail test"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := httptest.NewRecorder()
+	h.HandleQuery(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	var finalAnswerFound bool
+	for _, ev := range events {
+		if ev.Event == "final_answer" {
+			finalAnswerFound = true
+			var res QueryResponse
+			if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
+				t.Fatalf("failed to decode final answer: %v", err)
+			}
+			if res.Answer != "Longer comprehensive candidate answer" {
+				t.Errorf("expected fallback to pick longest candidate, got: %s", res.Answer)
+			}
+			if !strings.Contains(res.Source, "peer-review-failed-fallback") {
+				t.Errorf("expected source to contain 'peer-review-failed-fallback', got: %s", res.Source)
+			}
+		}
+	}
+	if !finalAnswerFound {
+		t.Errorf("expected final_answer event on peer review failure fallback")
+	}
+}
+
+func testScenario3D_ChairmanFails(t *testing.T) {
+	client1 := &handlerMockLLMClient{
+		Name: "mock:cand-1",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "Draft from model 1", Model: "mock:cand-1"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return &llm.Response{Answer: "RANKING: B, A\nREASONING: Model 2 is superior", Model: "mock:cand-1"}, nil
+		},
+	}
+	client2 := &handlerMockLLMClient{
+		Name: "mock:cand-2",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{Answer: "Draft from model 2 (Ranked Best)", Model: "mock:cand-2"}, nil
+		},
+		GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+			return &llm.Response{Answer: "RANKING: B, A\nREASONING: Model 2 is superior", Model: "mock:cand-2"}, nil
+		},
+	}
+	chairmanFailing := &handlerMockLLMClient{
+		Name: "mock:failing-chairman",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return nil, fmt.Errorf("simulated upstream chairman API 500 error")
+		},
+	}
+
+	h := setupTestHandlersWithCouncil(t, []llm.LLMClient{client1, client2}, chairmanFailing)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Chairman fail test"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := httptest.NewRecorder()
+	h.HandleQuery(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	var finalAnswerFound bool
+	for _, ev := range events {
+		if ev.Event == "final_answer" {
+			finalAnswerFound = true
+			var res QueryResponse
+			if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
+				t.Fatalf("failed to decode final answer: %v", err)
+			}
+			if res.Answer != "Draft from model 2 (Ranked Best)" {
+				t.Errorf("expected chairman failure fallback to select top-ranked model 2, got: %s", res.Answer)
+			}
+			if !strings.Contains(res.Source, "chairman-failed-fallback") {
+				t.Errorf("expected source to contain 'chairman-failed-fallback', got: %s", res.Source)
+			}
+		}
+	}
+	if !finalAnswerFound {
+		t.Errorf("expected final_answer event on chairman failure fallback")
+	}
+}
+
 func TestEmpirical_Scenario3_PartialModelFailureMatrix(t *testing.T) {
-	t.Run("3A: 1 of 3 Models Errors Out -> 2 Candidates Deliberate Cleanly", func(t *testing.T) {
-		clientGood1 := &handlerMockLLMClient{
-			Name: "mock:good-1",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{Answer: "Good 1 draft", Model: "mock:good-1"}, nil
-			},
-			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
-				return &llm.Response{Answer: "RANKING: A, B\nREASONING: Good 1 review", Model: "mock:good-1"}, nil
-			},
-		}
-		clientFailing := &handlerMockLLMClient{
-			Name: "mock:failing-model",
-			Fail: true,
-		}
-		clientGood2 := &handlerMockLLMClient{
-			Name: "mock:good-2",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{Answer: "Good 2 draft", Model: "mock:good-2"}, nil
-			},
-			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
-				return &llm.Response{Answer: "RANKING: B, A\nREASONING: Good 2 review", Model: "mock:good-2"}, nil
-			},
-		}
-		chairman := &handlerMockLLMClient{
-			Name: "mock:chairman",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{
-					Answer: `{"answer":"Synthesized answer from 2 remaining healthy models","confidence":0.88,"source":"mock:chairman"}`,
-					Model:  "mock:chairman",
-				}, nil
-			},
-		}
-
-		h := setupTestHandlersWithCouncil(t, []llm.LLMClient{clientGood1, clientFailing, clientGood2}, chairman)
-
-		req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Partial failure 1 of 3 test"}`))
-		req.Header.Set("Accept", "text/event-stream")
-
-		w := httptest.NewRecorder()
-		h.HandleQuery(w, req)
-
-		events := parseSSEEvents(w.Body.String())
-		if len(events) == 0 {
-			t.Fatalf("no SSE events received: %s", w.Body.String())
-		}
-
-		var errorDraftFound, finalAnswerFound bool
-		var validDraftCount int
-
-		for _, ev := range events {
-			if ev.Event == "candidate_draft" {
-				var draft council.CandidateDraftPayload
-				if err := json.Unmarshal([]byte(ev.Data), &draft); err != nil {
-					t.Fatalf("failed to decode draft: %v", err)
-				}
-				if draft.Error != "" {
-					errorDraftFound = true
-					if draft.Model != "mock:failing-model" {
-						t.Errorf("expected failing model to be mock:failing-model, got %s", draft.Model)
-					}
-				} else {
-					validDraftCount++
-				}
-			}
-			if ev.Event == "final_answer" {
-				finalAnswerFound = true
-				var res QueryResponse
-				if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
-					t.Fatalf("failed to unmarshal final answer: %v", err)
-				}
-				if res.Answer != "Synthesized answer from 2 remaining healthy models" {
-					t.Errorf("unexpected final answer: %s", res.Answer)
-				}
-				if res.Confidence != 0.88 {
-					t.Errorf("expected confidence 0.88, got %f", res.Confidence)
-				}
-			}
-		}
-
-		if !errorDraftFound {
-			t.Errorf("expected an error candidate_draft event for failing model")
-		}
-		if validDraftCount != 2 {
-			t.Errorf("expected 2 valid candidate drafts, got %d", validDraftCount)
-		}
-		if !finalAnswerFound {
-			t.Errorf("expected final_answer event to be emitted successfully despite 1 model failure")
-		}
-	})
-
-	t.Run("3B: 2 of 3 Models Error Out -> Single Model Fallback (Skip Review & Chairman)", func(t *testing.T) {
-		clientFail1 := &handlerMockLLMClient{Name: "mock:fail-1", Fail: true}
-		clientGood := &handlerMockLLMClient{
-			Name: "mock:only-survivor",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{Answer: "Survivor response", Model: "mock:only-survivor"}, nil
-			},
-		}
-		clientFail2 := &handlerMockLLMClient{Name: "mock:fail-2", Fail: true}
-
-		h := setupTestHandlersWithCouncil(t, []llm.LLMClient{clientFail1, clientGood, clientFail2}, nil)
-
-		req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "2 of 3 fail test"}`))
-		req.Header.Set("Accept", "text/event-stream")
-
-		w := httptest.NewRecorder()
-		h.HandleQuery(w, req)
-
-		events := parseSSEEvents(w.Body.String())
-		var finalAnswerFound bool
-		var peerReviewCount int
-
-		for _, ev := range events {
-			if ev.Event == "peer_review" {
-				peerReviewCount++
-			}
-			if ev.Event == "final_answer" {
-				finalAnswerFound = true
-				var res QueryResponse
-				if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
-					t.Fatalf("failed to unmarshal final answer: %v", err)
-				}
-				if res.Answer != "Survivor response" {
-					t.Errorf("expected survivor response, got: %s", res.Answer)
-				}
-				if !strings.Contains(res.Source, "single-response") {
-					t.Errorf("expected source to indicate single-response, got: %s", res.Source)
-				}
-			}
-		}
-
-		if peerReviewCount > 0 {
-			t.Errorf("peer review should be skipped when only 1 model succeeds, but got %d reviews", peerReviewCount)
-		}
-		if !finalAnswerFound {
-			t.Errorf("final_answer event was not emitted for single model fallback")
-		}
-	})
-
-	t.Run("3C: Peer Review Complete Failure -> Fallback to Best Candidate", func(t *testing.T) {
-		client1 := &handlerMockLLMClient{
-			Name: "mock:cand-1",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{Answer: "Short candidate answer", Model: "mock:cand-1"}, nil
-			},
-			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
-				return nil, context.DeadlineExceeded // All peer reviews fail
-			},
-		}
-		client2 := &handlerMockLLMClient{
-			Name: "mock:cand-2",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{Answer: "Longer comprehensive candidate answer", Model: "mock:cand-2"}, nil
-			},
-			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
-				return nil, context.DeadlineExceeded // All peer reviews fail
-			},
-		}
-
-		h := setupTestHandlersWithCouncil(t, []llm.LLMClient{client1, client2}, nil)
-
-		req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Peer review fail test"}`))
-		req.Header.Set("Accept", "text/event-stream")
-
-		w := httptest.NewRecorder()
-		h.HandleQuery(w, req)
-
-		events := parseSSEEvents(w.Body.String())
-		var finalAnswerFound bool
-		for _, ev := range events {
-			if ev.Event == "final_answer" {
-				finalAnswerFound = true
-				var res QueryResponse
-				if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
-					t.Fatalf("failed to decode final answer: %v", err)
-				}
-				if res.Answer != "Longer comprehensive candidate answer" {
-					t.Errorf("expected fallback to pick longest candidate, got: %s", res.Answer)
-				}
-				if !strings.Contains(res.Source, "peer-review-failed-fallback") {
-					t.Errorf("expected source to contain 'peer-review-failed-fallback', got: %s", res.Source)
-				}
-			}
-		}
-		if !finalAnswerFound {
-			t.Errorf("expected final_answer event on peer review failure fallback")
-		}
-	})
-
-	t.Run("3D: Chairman Synthesis Failure -> Fallback to Best Peer-Reviewed Candidate", func(t *testing.T) {
-		client1 := &handlerMockLLMClient{
-			Name: "mock:cand-1",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{Answer: "Draft from model 1", Model: "mock:cand-1"}, nil
-			},
-			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
-				return &llm.Response{Answer: "RANKING: B, A\nREASONING: Model 2 is superior", Model: "mock:cand-1"}, nil
-			},
-		}
-		client2 := &handlerMockLLMClient{
-			Name: "mock:cand-2",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return &llm.Response{Answer: "Draft from model 2 (Ranked Best)", Model: "mock:cand-2"}, nil
-			},
-			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
-				return &llm.Response{Answer: "RANKING: B, A\nREASONING: Model 2 is superior", Model: "mock:cand-2"}, nil
-			},
-		}
-		chairmanFailing := &handlerMockLLMClient{
-			Name: "mock:failing-chairman",
-			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
-				return nil, fmt.Errorf("simulated upstream chairman API 500 error")
-			},
-		}
-
-		h := setupTestHandlersWithCouncil(t, []llm.LLMClient{client1, client2}, chairmanFailing)
-
-		req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Chairman fail test"}`))
-		req.Header.Set("Accept", "text/event-stream")
-
-		w := httptest.NewRecorder()
-		h.HandleQuery(w, req)
-
-		events := parseSSEEvents(w.Body.String())
-		var finalAnswerFound bool
-		for _, ev := range events {
-			if ev.Event == "final_answer" {
-				finalAnswerFound = true
-				var res QueryResponse
-				if err := json.Unmarshal([]byte(ev.Data), &res); err != nil {
-					t.Fatalf("failed to decode final answer: %v", err)
-				}
-				if res.Answer != "Draft from model 2 (Ranked Best)" {
-					t.Errorf("expected chairman failure fallback to select top-ranked model 2, got: %s", res.Answer)
-				}
-				if !strings.Contains(res.Source, "chairman-failed-fallback") {
-					t.Errorf("expected source to contain 'chairman-failed-fallback', got: %s", res.Source)
-				}
-			}
-		}
-		if !finalAnswerFound {
-			t.Errorf("expected final_answer event on chairman failure fallback")
-		}
-	})
+	t.Run("3A: 1 of 3 Models Errors Out -> 2 Candidates Deliberate Cleanly", testScenario3A_OneModelFails)
+	t.Run("3B: 2 of 3 Models Error Out -> Single Model Fallback (Skip Review & Chairman)", testScenario3B_TwoModelsFail)
+	t.Run("3C: Peer Review Complete Failure -> Fallback to Best Candidate", testScenario3C_PeerReviewFails)
+	t.Run("3D: Chairman Synthesis Failure -> Fallback to Best Peer-Reviewed Candidate", testScenario3D_ChairmanFails)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

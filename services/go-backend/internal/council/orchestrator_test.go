@@ -68,6 +68,65 @@ func (m *testMockLLMClient) GenerateChat(ctx context.Context, opts llm.GenerateO
 	}, nil
 }
 
+func verifyCandidateDraftEvent(t *testing.T, ev StreamEvent) {
+	payload, ok := ev.Data.(CandidateDraftPayload)
+	if !ok {
+		t.Errorf("expected CandidateDraftPayload, got %T", ev.Data)
+	}
+	if payload.Answer == "" || payload.Model == "" {
+		t.Errorf("invalid draft payload: %+v", payload)
+	}
+}
+
+func verifyPeerReviewEvent(t *testing.T, ev StreamEvent) {
+	payload, ok := ev.Data.(PeerReviewPayload)
+	if !ok {
+		t.Errorf("expected PeerReviewPayload, got %T", ev.Data)
+	}
+	if payload.Reviewer == "" || payload.Review == "" {
+		t.Errorf("invalid review payload: %+v", payload)
+	}
+}
+
+func verifyFinalAnswerEvent(t *testing.T, ev StreamEvent) {
+	result, ok := ev.Data.(*CouncilResult)
+	if !ok {
+		t.Errorf("expected *CouncilResult, got %T", ev.Data)
+	}
+	if result.FinalAnswer == "" {
+		t.Errorf("empty final answer in event")
+	}
+}
+
+func verifyMockStreamEvents(t *testing.T, events []StreamEvent) {
+	var draftCount, reviewCount int
+	var foundFinal bool
+
+	for _, ev := range events {
+		switch ev.Type {
+		case EventCandidateDraft:
+			draftCount++
+			verifyCandidateDraftEvent(t, ev)
+		case EventPeerReview:
+			reviewCount++
+			verifyPeerReviewEvent(t, ev)
+		case EventFinalAnswer:
+			foundFinal = true
+			verifyFinalAnswerEvent(t, ev)
+		}
+	}
+
+	if draftCount != 3 {
+		t.Errorf("expected 3 candidate_draft events, got %d", draftCount)
+	}
+	if reviewCount != 3 {
+		t.Errorf("expected 3 peer_review events, got %d", reviewCount)
+	}
+	if !foundFinal {
+		t.Errorf("final_answer event was not emitted")
+	}
+}
+
 func TestOrchestratorQueryStream_Mock(t *testing.T) {
 	os.Setenv("MOCK_LLM", "true")
 	defer os.Unsetenv("MOCK_LLM")
@@ -95,50 +154,7 @@ func TestOrchestratorQueryStream_Mock(t *testing.T) {
 		t.Fatalf("expected non-nil CouncilResult")
 	}
 
-	var draftCount, reviewCount int
-	var foundFinal bool
-
-	for _, ev := range events {
-		switch ev.Type {
-		case EventCandidateDraft:
-			draftCount++
-			payload, ok := ev.Data.(CandidateDraftPayload)
-			if !ok {
-				t.Errorf("expected CandidateDraftPayload, got %T", ev.Data)
-			}
-			if payload.Answer == "" || payload.Model == "" {
-				t.Errorf("invalid draft payload: %+v", payload)
-			}
-		case EventPeerReview:
-			reviewCount++
-			payload, ok := ev.Data.(PeerReviewPayload)
-			if !ok {
-				t.Errorf("expected PeerReviewPayload, got %T", ev.Data)
-			}
-			if payload.Reviewer == "" || payload.Review == "" {
-				t.Errorf("invalid review payload: %+v", payload)
-			}
-		case EventFinalAnswer:
-			foundFinal = true
-			result, ok := ev.Data.(*CouncilResult)
-			if !ok {
-				t.Errorf("expected *CouncilResult, got %T", ev.Data)
-			}
-			if result.FinalAnswer == "" {
-				t.Errorf("empty final answer in event")
-			}
-		}
-	}
-
-	if draftCount != 3 {
-		t.Errorf("expected 3 candidate_draft events, got %d", draftCount)
-	}
-	if reviewCount != 3 {
-		t.Errorf("expected 3 peer_review events, got %d", reviewCount)
-	}
-	if !foundFinal {
-		t.Errorf("final_answer event was not emitted")
-	}
+	verifyMockStreamEvents(t, events)
 }
 
 func TestOrchestratorQueryDirectStream_Mock(t *testing.T) {

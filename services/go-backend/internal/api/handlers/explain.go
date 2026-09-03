@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -59,21 +60,18 @@ type ExplainResponse struct {
 }
 
 // HandleExplain generates customized summaries and explanations of documents.
-func (h *Handlers) HandleExplain(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	userID := middleware.GetUserID(r.Context())
-
+func (h *Handlers) validateExplainRequest(w http.ResponseWriter, r *http.Request) (*ExplainRequest, bool) {
 	var req ExplainRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if req.KnowledgeLevel == "" && req.Level != "" {
 		req.KnowledgeLevel = req.Level
 	}
 	if req.DocID == "" {
 		jsonError(w, "doc_id is required", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if req.KnowledgeLevel == "" {
 		req.KnowledgeLevel = "beginner"
@@ -81,32 +79,32 @@ func (h *Handlers) HandleExplain(w http.ResponseWriter, r *http.Request) {
 	if req.Depth == "" {
 		req.Depth = "section-wise"
 	}
+	return &req, true
+}
 
-	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte("explain:"+req.DocID+":"+req.KnowledgeLevel+":"+req.Depth)))[:16]
-	cacheKey := fmt.Sprintf("explain:%s:%s:%s", req.DocID, req.KnowledgeLevel, req.Depth)
-
+func (h *Handlers) checkExplainCache(
+	ctx context.Context,
+	w http.ResponseWriter,
+	cacheKey, queryHash, userID, docID string,
+	start time.Time,
+) bool {
+	if h.Cache == nil {
+		return false
+	}
 	var cachedResponse ExplainResponse
-	if found, err := h.Cache.Get(r.Context(), cacheKey, &cachedResponse); err == nil && found {
+	if found, err := h.Cache.Get(ctx, cacheKey, &cachedResponse); err == nil && found {
 		cachedResponse.CacheHit = true
 		cachedResponse.Latency = time.Since(start).String()
-		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "cache_hit")
+		if h.Audit != nil {
+			h.Audit.LogQuery(userID, docID, queryHash, time.Since(start), "cache_hit")
+		}
 		jsonResponse(w, cachedResponse)
-		return
+		return true
 	}
+	return false
+}
 
-	chunks, err := h.retrieveAllChunks(req.DocID)
-	if err != nil {
-		log.Printf("[Explain] Retrieval failed: %v", err)
-		jsonError(w, "failed to retrieve document", http.StatusInternalServerError)
-		return
-	}
-	if len(chunks) == 0 {
-		jsonError(w, "document not found or empty", http.StatusNotFound)
-		return
-	}
-
-	contextText := strings.Join(chunks, "\n\n---\n\n")
-
+func buildExplainPrompt(contextText string, req *ExplainRequest) string {
 	focusClause := ""
 	if len(req.FocusTopics) > 0 {
 		focusClause = fmt.Sprintf("\n\nFocus especially on these topics: %s", strings.Join(req.FocusTopics, ", "))
@@ -130,7 +128,7 @@ func (h *Handlers) HandleExplain(w http.ResponseWriter, r *http.Request) {
 		levelInstruction = "Explain as if to someone completely new to the subject."
 	}
 
-	prompt := fmt.Sprintf(`You are an expert educator. Based ONLY on the following document excerpts, generate an explanation.
+	return fmt.Sprintf(`You are an expert educator. Based ONLY on the following document excerpts, generate an explanation.
 
 Document Excerpts:
 %s
@@ -142,12 +140,43 @@ Instructions:
 - Use clear formatting with headings and structure%s
 
 Respond with a well-structured explanation.`, contextText, levelInstruction, depthInstruction, focusClause)
+}
 
+func (h *Handlers) HandleExplain(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	userID := middleware.GetUserID(r.Context())
+
+	req, ok := h.validateExplainRequest(w, r)
+	if !ok {
+		return
+	}
+
+	cacheKey := fmt.Sprintf("explain:%s:%s:%s", req.DocID, req.KnowledgeLevel, req.Depth)
+	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte(cacheKey)))[:16]
+
+	if h.checkExplainCache(r.Context(), w, cacheKey, queryHash, userID, req.DocID, start) {
+		return
+	}
+
+	chunks, err := h.retrieveAllChunks(req.DocID)
+	if err != nil {
+		log.Printf("[Explain] Retrieval failed: %v", err)
+		jsonError(w, "failed to retrieve document", http.StatusInternalServerError)
+		return
+	}
+	if len(chunks) == 0 {
+		jsonError(w, "document not found or empty", http.StatusNotFound)
+		return
+	}
+
+	prompt := buildExplainPrompt(strings.Join(chunks, "\n\n---\n\n"), req)
 	result, err := h.Council.Query(r.Context(), "explain:"+req.DocID, chunks, prompt, false, "council", nil)
 	if err != nil {
 		log.Printf("[Explain] Council failed: %v", err)
 		jsonError(w, "explanation generation failed", http.StatusInternalServerError)
-		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "council_error")
+		if h.Audit != nil {
+			h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "council_error")
+		}
 		return
 	}
 
@@ -159,10 +188,14 @@ Respond with a well-structured explanation.`, contextText, levelInstruction, dep
 		CacheHit:    false,
 	}
 
-	if err := h.Cache.Set(r.Context(), cacheKey, response); err != nil {
-		log.Printf("[Explain] Cache set failed: %v", err)
+	if h.Cache != nil {
+		if err := h.Cache.Set(r.Context(), cacheKey, response); err != nil {
+			log.Printf("[Explain] Cache set failed: %v", err)
+		}
 	}
 
-	h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "success")
+	if h.Audit != nil {
+		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "success")
+	}
 	jsonResponse(w, response)
 }

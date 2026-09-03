@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -716,6 +717,7 @@ func parseSSEEvents(raw string) []ParsedSSEEvent {
 type StreamingRecorder struct {
 	*httptest.ResponseRecorder
 	FlushChan chan struct{}
+	mu        sync.RWMutex
 }
 
 func NewStreamingRecorder() *StreamingRecorder {
@@ -723,6 +725,32 @@ func NewStreamingRecorder() *StreamingRecorder {
 		ResponseRecorder: httptest.NewRecorder(),
 		FlushChan:        make(chan struct{}, 100),
 	}
+}
+
+func (r *StreamingRecorder) Write(b []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ResponseRecorder.Write(b)
+}
+
+func (r *StreamingRecorder) BodyString() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.ResponseRecorder.Body == nil {
+		return ""
+	}
+	return r.ResponseRecorder.Body.String()
+}
+
+func (r *StreamingRecorder) BodyBytes() []byte {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.ResponseRecorder.Body == nil {
+		return nil
+	}
+	cp := make([]byte, r.ResponseRecorder.Body.Len())
+	copy(cp, r.ResponseRecorder.Body.Bytes())
+	return cp
 }
 
 func (r *StreamingRecorder) Flush() {
@@ -814,6 +842,75 @@ func TestHandleQuery_SSE_Headers(t *testing.T) {
 	}
 }
 
+func verifyDeliberationCandidateDraft(t *testing.T, dataStr string) {
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
+		t.Errorf("candidate_draft data failed to unmarshal: %v", err)
+		return
+	}
+	if data["model"] == nil || data["answer"] == nil {
+		t.Errorf("candidate_draft missing model or answer: %v", data)
+	}
+	if data["model_name"] == nil || data["content"] == nil {
+		t.Errorf("candidate_draft missing compatibility aliases: %v", data)
+	}
+}
+
+func verifyDeliberationPeerReview(t *testing.T, dataStr string) {
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
+		t.Errorf("peer_review data failed to unmarshal: %v", err)
+		return
+	}
+	if data["reviewer"] == nil || data["review"] == nil {
+		t.Errorf("peer_review missing reviewer or review: %v", data)
+	}
+}
+
+func verifyDeliberationFinalAnswer(t *testing.T, dataStr string) {
+	var data QueryResponse
+	if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
+		t.Errorf("final_answer data failed to unmarshal QueryResponse: %v", err)
+		return
+	}
+	if data.Answer != "Final consensus answer" {
+		t.Errorf("expected 'Final consensus answer', got %q", data.Answer)
+	}
+	if data.Confidence != 0.95 {
+		t.Errorf("expected confidence 0.95, got %f", data.Confidence)
+	}
+}
+
+func verifyDeliberationEventSequence(t *testing.T, events []ParsedSSEEvent) {
+	candidateCount := 0
+	peerReviewCount := 0
+	finalAnswerFound := false
+
+	for _, evt := range events {
+		switch evt.Event {
+		case "candidate_draft":
+			candidateCount++
+			verifyDeliberationCandidateDraft(t, evt.Data)
+		case "peer_review":
+			peerReviewCount++
+			verifyDeliberationPeerReview(t, evt.Data)
+		case "final_answer":
+			finalAnswerFound = true
+			verifyDeliberationFinalAnswer(t, evt.Data)
+		}
+	}
+
+	if candidateCount != 2 {
+		t.Errorf("expected 2 candidate_draft events, got %d", candidateCount)
+	}
+	if peerReviewCount != 2 {
+		t.Errorf("expected 2 peer_review events, got %d", peerReviewCount)
+	}
+	if !finalAnswerFound {
+		t.Errorf("final_answer event was not emitted")
+	}
+}
+
 func TestHandleQuery_SSE_FullDeliberationSequence(t *testing.T) {
 	mockClients := []llm.LLMClient{
 		&handlerMockLLMClient{
@@ -859,57 +956,7 @@ func TestHandleQuery_SSE_FullDeliberationSequence(t *testing.T) {
 		t.Fatalf("expected at least 5 SSE events (2 candidate_draft + 2 peer_review + 1 final_answer), got %d: %s", len(events), w.Body.String())
 	}
 
-	candidateCount := 0
-	peerReviewCount := 0
-	finalAnswerFound := false
-
-	for _, evt := range events {
-		switch evt.Event {
-		case "candidate_draft":
-			candidateCount++
-			var data map[string]interface{}
-			if err := json.Unmarshal([]byte(evt.Data), &data); err != nil {
-				t.Errorf("candidate_draft data failed to unmarshal: %v", err)
-			}
-			if data["model"] == nil || data["answer"] == nil {
-				t.Errorf("candidate_draft missing model or answer: %v", data)
-			}
-			if data["model_name"] == nil || data["content"] == nil {
-				t.Errorf("candidate_draft missing compatibility aliases: %v", data)
-			}
-		case "peer_review":
-			peerReviewCount++
-			var data map[string]interface{}
-			if err := json.Unmarshal([]byte(evt.Data), &data); err != nil {
-				t.Errorf("peer_review data failed to unmarshal: %v", err)
-			}
-			if data["reviewer"] == nil || data["review"] == nil {
-				t.Errorf("peer_review missing reviewer or review: %v", data)
-			}
-		case "final_answer":
-			finalAnswerFound = true
-			var data QueryResponse
-			if err := json.Unmarshal([]byte(evt.Data), &data); err != nil {
-				t.Errorf("final_answer data failed to unmarshal QueryResponse: %v", err)
-			}
-			if data.Answer != "Final consensus answer" {
-				t.Errorf("expected 'Final consensus answer', got %q", data.Answer)
-			}
-			if data.Confidence != 0.95 {
-				t.Errorf("expected confidence 0.95, got %f", data.Confidence)
-			}
-		}
-	}
-
-	if candidateCount != 2 {
-		t.Errorf("expected 2 candidate_draft events, got %d", candidateCount)
-	}
-	if peerReviewCount != 2 {
-		t.Errorf("expected 2 peer_review events, got %d", peerReviewCount)
-	}
-	if !finalAnswerFound {
-		t.Errorf("final_answer event was not emitted")
-	}
+	verifyDeliberationEventSequence(t, events)
 }
 
 func TestHandleQuery_SSE_TTFT_Under1500ms(t *testing.T) {
@@ -941,13 +988,20 @@ func TestHandleQuery_SSE_TTFT_Under1500ms(t *testing.T) {
 
 	h := setupTestHandlersWithCouncil(t, mockClients, mockChairman)
 
-	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "test TTFT"}`))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "test TTFT"}`)).WithContext(ctx)
 	req.Header.Set("Accept", "text/event-stream")
 
 	w := NewStreamingRecorder()
+	done := make(chan struct{})
 
 	start := time.Now()
-	go h.HandleQuery(w, req)
+	go func() {
+		defer close(done)
+		h.HandleQuery(w, req)
+	}()
 
 	// First flush is the stream header (status 200 OK)
 	select {
@@ -963,13 +1017,16 @@ func TestHandleQuery_SSE_TTFT_Under1500ms(t *testing.T) {
 		if ttft > 1500*time.Millisecond {
 			t.Errorf("TTFT exceeded 1.5s threshold: took %v", ttft)
 		}
-		events := parseSSEEvents(w.Body.String())
+		events := parseSSEEvents(w.BodyString())
 		if len(events) == 0 || events[0].Event != "candidate_draft" {
-			t.Errorf("expected first flushed event to be candidate_draft, got: %s", w.Body.String())
+			t.Errorf("expected first flushed event to be candidate_draft, got: %s", w.BodyString())
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for first candidate_draft event")
 	}
+
+	cancel()
+	<-done
 }
 
 func TestHandleQuery_JSON_BackwardCompatibility(t *testing.T) {

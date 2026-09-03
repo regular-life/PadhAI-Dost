@@ -5,7 +5,7 @@ This document tracks known engineering gaps, technical debt, and future feature 
 ## Go Backend
 
 ### Authentication & Persistence
-- [ ] `auth.go`: Persist users in Redis or relational database (currently using a simple memory-map).
+- [x] `auth.go`: Persist users in PostgreSQL with connection pool, schema initialization, and bcrypt hashing (`PostgresUserRepository`).
 - [ ] `auth.go`: Track failed login attempts in cache to throttle brute-force attacks.
 - [ ] `auth.go`: Implement password complexity constraints and email verification routes.
 
@@ -18,7 +18,7 @@ This document tracks known engineering gaps, technical debt, and future feature 
 - [ ] `ingest.go`: Return detailed status report on pipeline component health.
 
 ### Query Delivery & Analytics
-- [ ] `query.go`: Implement streaming chunk-by-chunk delivery to the client (Server-Sent Events).
+- [x] `query.go`: Implement streaming delivery to the client via Server-Sent Events (`Accept: text/event-stream`).
 - [ ] `questions.go`: Parse generated options and format them as structured JSON quizzes.
 
 ### Configuration & Tooling

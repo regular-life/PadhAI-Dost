@@ -179,6 +179,13 @@ func (h *Handlers) retrieveChunks(r *http.Request, req QueryRequest) ([]string, 
 	return chunks, nil
 }
 
+func recordSpanErr(span trace.Span, err error) {
+	if span != nil && err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+}
+
 // getEmbedding generates a vector embedding for the input text from the RAG service.
 func (h *Handlers) getEmbedding(ctx context.Context, text string) ([]float32, error) {
 	if ctx == nil {
@@ -202,19 +209,13 @@ func (h *Handlers) getEmbedding(ctx context.Context, text string) ([]float32, er
 	reqBody := map[string]string{"text": text}
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		if span != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		recordSpanErr(span, err)
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", h.RAGServiceURL+"/embed", bytes.NewReader(jsonBody))
 	if err != nil {
-		if span != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		recordSpanErr(span, err)
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -223,10 +224,7 @@ func (h *Handlers) getEmbedding(ctx context.Context, text string) ([]float32, er
 	}
 	resp, err := h.HTTPClient.Do(httpReq)
 	if err != nil {
-		if span != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		recordSpanErr(span, err)
 		return nil, fmt.Errorf("embed request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -247,10 +245,7 @@ func (h *Handlers) getEmbedding(ctx context.Context, text string) ([]float32, er
 		Embedding []float32 `json:"embedding"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		if span != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
+		recordSpanErr(span, err)
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 	if span != nil {

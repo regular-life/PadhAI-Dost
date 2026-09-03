@@ -23,15 +23,7 @@ import (
 	"github.com/regular-life/CouncilAI/go-backend/internal/telemetry"
 )
 
-func main() {
-	log.Println("Starting CouncilAI Go Backend v2.0...")
-
-	cfg := config.Load()
-
-	// ── Core infrastructure ─────────────────────────────────────────
-	jwtManager := auth.NewJWTManager(cfg.JWTSecret, cfg.JWTExpiration)
-
-	// Shared Redis Circuit Breaker for unified failure detection across L1 and L2
+func initInfrastructure(cfg *config.Config) (*cache.RedisCache, *cache.RedisSemanticCache, *audit.Logger, *memory.ConversationStore) {
 	cbConfig := cache.Config{
 		FailureThreshold: cfg.CircuitBreakerFailureThreshold,
 		SuccessThreshold: cfg.CircuitBreakerSuccessThreshold,
@@ -48,18 +40,18 @@ func main() {
 	if err := semCache.EnsureIndex(context.Background()); err != nil {
 		log.Printf("[Warning] Failed to ensure RediSearch index: %v", err)
 	}
-	defer semCache.Close()
-	auditLogger := audit.NewLogger()
 
-	// ── Conversation memory ─────────────────────────────────────────
+	auditLogger := audit.NewLogger()
 	convStore := memory.NewConversationStore(
 		cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB,
-		10,           // max turns per session
-		24*time.Hour, // TTL
+		10,
+		24*time.Hour,
 	)
-	defer convStore.Close()
 
-	// ── LLM provider configuration ──────────────────────────────────
+	return redisCache, semCache, auditLogger, convStore
+}
+
+func initCouncilPipeline(cfg *config.Config) ([]llm.LLMClient, llm.LLMClient, *agent.Router, *agent.IngestAgent) {
 	keys := llm.ProviderKeys{
 		Gemini:     cfg.GeminiAPIKey,
 		OpenRouter: cfg.OpenRouterAPIKey,
@@ -71,7 +63,6 @@ func main() {
 		VLLM:       cfg.VLLMURL,
 	}
 
-	// ── Dynamic council creation ────────────────────────────────────
 	var councilClients []llm.LLMClient
 	for i, slot := range cfg.CouncilSlots {
 		if slot.Model == "" {
@@ -88,7 +79,6 @@ func main() {
 		log.Fatal("No council members configured. Set at least COUNCIL_1_PROVIDER and COUNCIL_1_MODEL.")
 	}
 
-	// ── Chairman ────────────────────────────────────────────────────
 	chairmanClient, err := llm.NewClientFromProvider(
 		cfg.ChairmanSlot.Provider, cfg.ChairmanSlot.Model, keys, urls, cfg.StageTimeout,
 	)
@@ -96,26 +86,24 @@ func main() {
 		log.Fatalf("Chairman: %v", err)
 	}
 
-	// ── Router agent ────────────────────────────────────────────────
 	routerClient, err := llm.NewClientFromProvider(
 		cfg.RouterSlot.Provider, cfg.RouterSlot.Model, keys, urls, 15*time.Second,
 	)
 	if err != nil {
 		log.Fatalf("Router agent: %v", err)
 	}
-	queryRouter := agent.NewRouter(routerClient)
 
-	// ── Ingest agent ────────────────────────────────────────────────
 	ingestClient, err := llm.NewClientFromProvider(
 		cfg.IngestionSlot.Provider, cfg.IngestionSlot.Model, keys, urls, 30*time.Second,
 	)
 	if err != nil {
 		log.Fatalf("Ingest agent: %v", err)
 	}
-	ingestAgent := agent.NewIngestAgent(ingestClient)
 
-	// ── User Repository (PostgreSQL with Memory Fallback) ─────────────
-	var userRepo auth.UserRepository
+	return councilClients, chairmanClient, agent.NewRouter(routerClient), agent.NewIngestAgent(ingestClient)
+}
+
+func initUserRepository(cfg *config.Config) auth.UserRepository {
 	pgConfig := auth.PostgresConfig{
 		URL:             cfg.DatabaseURL,
 		Host:            cfg.DBHost,
@@ -138,22 +126,22 @@ func main() {
 		log.Printf("[Warning] PostgreSQL initialization failed: %v. Falling back to MemoryUserRepository", err)
 		memRepo := auth.NewMemoryUserRepository()
 		_ = memRepo.SeedDemoUser(context.Background(), "demo", "demo123")
-		userRepo = memRepo
-	} else {
-		log.Println("Connected to PostgreSQL successfully")
-		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := pgRepo.InitSchema(initCtx); err != nil {
-			log.Fatalf("Failed to initialize PostgreSQL schema: %v", err)
-		}
-		if err := pgRepo.SeedDemoUser(initCtx, "demo", "demo123"); err != nil {
-			log.Printf("[Warning] Failed to seed demo user: %v", err)
-		}
-		initCancel()
-		userRepo = pgRepo
+		return memRepo
 	}
-	defer userRepo.Close()
 
-	// ── OpenTelemetry Tracing ───────────────────────────────────────
+	log.Println("Connected to PostgreSQL successfully")
+	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer initCancel()
+	if err := pgRepo.InitSchema(initCtx); err != nil {
+		log.Fatalf("Failed to initialize PostgreSQL schema: %v", err)
+	}
+	if err := pgRepo.SeedDemoUser(initCtx, "demo", "demo123"); err != nil {
+		log.Printf("[Warning] Failed to seed demo user: %v", err)
+	}
+	return pgRepo
+}
+
+func initTracer(cfg *config.Config) telemetry.ShutdownableTracerProvider {
 	env := os.Getenv("ENVIRONMENT")
 	if env == "" {
 		if cfg.Debug {
@@ -170,8 +158,45 @@ func main() {
 	})
 	if err != nil {
 		log.Printf("[Warning] Failed to initialize OpenTelemetry tracer: %v", err)
-	} else {
-		log.Println("OpenTelemetry distributed tracing initialized successfully")
+		return nil
+	}
+	log.Println("OpenTelemetry distributed tracing initialized successfully")
+	return tracer
+}
+
+func printStartupSummary(cfg *config.Config, councilClients []llm.LLMClient) {
+	log.Printf("Server listening on :%s", cfg.ServerPort)
+	log.Printf("RAG Service URL: %s", cfg.RAGServiceURL)
+	log.Printf("Council size: %d members", len(councilClients))
+	for i, slot := range cfg.CouncilSlots {
+		if slot.Model != "" {
+			log.Printf("  Member %d: %s/%s", i+1, slot.Provider, slot.Model)
+		}
+	}
+	log.Printf("Chairman: %s/%s", cfg.ChairmanSlot.Provider, cfg.ChairmanSlot.Model)
+	log.Printf("Router agent: using %s/%s", cfg.RouterSlot.Provider, cfg.RouterSlot.Model)
+	if cfg.VLLMConfig.Enabled {
+		log.Printf("vLLM local inference: auto-enabled (model: %s, quantization: %s)",
+			cfg.VLLMConfig.ModelName, cfg.VLLMConfig.Quantization)
+	}
+}
+
+func main() {
+	log.Println("Starting CouncilAI Go Backend v2.0...")
+	cfg := config.Load()
+
+	jwtManager := auth.NewJWTManager(cfg.JWTSecret, cfg.JWTExpiration)
+	redisCache, semCache, auditLogger, convStore := initInfrastructure(cfg)
+	defer redisCache.Close()
+	defer semCache.Close()
+	defer convStore.Close()
+
+	councilClients, chairmanClient, queryRouter, ingestAgent := initCouncilPipeline(cfg)
+	userRepo := initUserRepository(cfg)
+	defer userRepo.Close()
+
+	tracer := initTracer(cfg)
+	if tracer != nil {
 		defer func() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -181,7 +206,6 @@ func main() {
 		}()
 	}
 
-	// ── Wire everything together ────────────────────────────────────
 	councilOrchestrator := council.NewOrchestrator(councilClients, chairmanClient, cfg.StageTimeout)
 	if tracer != nil {
 		councilOrchestrator.SetTracer(tracer)
@@ -201,10 +225,10 @@ func main() {
 	if tracer != nil {
 		h.SetTracer(tracer)
 	}
+
 	authHandler := handlers.NewAuthHandler(jwtManager, userRepo)
 	router := api.NewRouter(cfg, h, authHandler, jwtManager)
 
-	// ── HTTP server ─────────────────────────────────────────────────
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.ServerPort),
 		Handler:      router,
@@ -231,24 +255,7 @@ func main() {
 		log.Println("Server stopped")
 	}()
 
-	// ── Startup log ─────────────────────────────────────────────────
-	log.Printf("Server listening on :%s", cfg.ServerPort)
-	log.Printf("RAG Service URL: %s", cfg.RAGServiceURL)
-	log.Printf("Council size: %d members", len(councilClients))
-	for i, slot := range cfg.CouncilSlots {
-		if slot.Model != "" {
-			log.Printf("  Member %d: %s/%s", i+1, slot.Provider, slot.Model)
-		}
-	}
-	log.Printf("Chairman: %s/%s", cfg.ChairmanSlot.Provider, cfg.ChairmanSlot.Model)
-	log.Printf("Router agent: using %s/%s", cfg.ChairmanSlot.Provider, cfg.ChairmanSlot.Model)
-	if cfg.VLLMConfig.Enabled {
-		log.Printf("vLLM local inference: auto-enabled (model: %s, quantization: %s)",
-			cfg.VLLMConfig.ModelName, cfg.VLLMConfig.Quantization)
-		log.Println("  [IMPORTANT] If using Docker Compose, make sure to start the service using the 'local-models' profile:")
-		log.Println("              docker compose --profile local-models up --build")
-	}
-
+	printStartupSummary(cfg, councilClients)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server failed: %v", err)
 	}

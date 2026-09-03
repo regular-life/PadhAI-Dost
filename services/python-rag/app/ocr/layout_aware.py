@@ -39,6 +39,60 @@ class LayoutAwareOCR(OCRBackend):
 
         return self._process_pdf(file_bytes, filename)
 
+    def _extract_page_tables(self, page, page_num: int) -> tuple[list[OCRBlock], list]:
+        """Extract table blocks and their bounding boxes from a PDF page."""
+        blocks: list[OCRBlock] = []
+        table_bboxes = []
+        tables = page.extract_tables()
+        if not tables:
+            return blocks, table_bboxes
+
+        for table_obj in page.find_tables():
+            table_bboxes.append(table_obj.bbox)
+
+        for table in tables:
+            table_text = self._format_table(table)
+            if table_text.strip():
+                blocks.append(
+                    OCRBlock(
+                        content=table_text,
+                        block_type=ChunkType.TABLE,
+                        page_number=page_num,
+                        confidence=0.9,
+                    )
+                )
+        return blocks, table_bboxes
+
+    def _extract_page_paragraphs(self, page, table_bboxes: list, page_num: int) -> list[OCRBlock]:
+        """Extract non-table text blocks and classify them into paragraphs/headings."""
+        blocks: list[OCRBlock] = []
+        if table_bboxes:
+            def _not_in_table(obj):
+                if obj.get("object_type") != "char":
+                    return True
+                x0, top, x1, bottom = obj["x0"], obj["top"], obj["x1"], obj["bottom"]
+                for tx0, ty0, tx1, ty1 in table_bboxes:
+                    if tx0 <= x0 <= tx1 and ty0 <= top <= ty1:
+                        return False
+                return True
+            non_table_page = page.filter(_not_in_table)
+            text = non_table_page.extract_text() or ""
+        else:
+            text = page.extract_text() or ""
+
+        if text.strip():
+            for para in self._split_paragraphs(text):
+                if para.strip():
+                    blocks.append(
+                        OCRBlock(
+                            content=para.strip(),
+                            block_type=self._classify_block(para),
+                            page_number=page_num,
+                            confidence=0.95,
+                        )
+                    )
+        return blocks
+
     def _process_pdf(self, file_bytes: bytes, filename: str) -> OCRResult:
         """Extract tables and surrounding paragraphs using pdfplumber."""
         import pdfplumber
@@ -49,57 +103,11 @@ class LayoutAwareOCR(OCRBackend):
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 page_count = len(pdf.pages)
-
                 for page_num, page in enumerate(pdf.pages, start=1):
-                    tables = page.extract_tables()
-                    table_bboxes = []
-
-                    if tables:
-                        for table_obj in page.find_tables():
-                            table_bboxes.append(table_obj.bbox)
-
-                        for table in tables:
-                            table_text = self._format_table(table)
-                            if table_text.strip():
-                                blocks.append(
-                                    OCRBlock(
-                                        content=table_text,
-                                        block_type=ChunkType.TABLE,
-                                        page_number=page_num,
-                                        confidence=0.9,
-                                    )
-                                )
-
-                    # Filter out characters that fall within table bounding boxes to prevent double-extraction.
-                    if table_bboxes:
-                        def _not_in_table(obj):
-                            """Filters out PDF character objects contained within extracted table bounding boxes."""
-                            if obj.get("object_type") != "char":
-                                return True
-                            x0, top, x1, bottom = obj["x0"], obj["top"], obj["x1"], obj["bottom"]
-                            for tx0, ty0, tx1, ty1 in table_bboxes:
-                                if tx0 <= x0 <= tx1 and ty0 <= top <= ty1:
-                                    return False
-                            return True
-                        non_table_page = page.filter(_not_in_table)
-                        text = non_table_page.extract_text() or ""
-                    else:
-                        text = page.extract_text() or ""
-
-                    if text.strip():
-                        paragraphs = self._split_paragraphs(text)
-                        for para in paragraphs:
-                            if para.strip():
-                                block_type = self._classify_block(para)
-                                blocks.append(
-                                    OCRBlock(
-                                        content=para.strip(),
-                                        block_type=block_type,
-                                        page_number=page_num,
-                                        confidence=0.95,
-                                    )
-                                )
-
+                    tbl_blocks, bboxes = self._extract_page_tables(page, page_num)
+                    blocks.extend(tbl_blocks)
+                    para_blocks = self._extract_page_paragraphs(page, bboxes, page_num)
+                    blocks.extend(para_blocks)
         except Exception as e:
             logger.error(f"Layout-aware OCR failed: {e}")
 

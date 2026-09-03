@@ -71,36 +71,7 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, eventType string, dat
 
 // HandleQuery processes a user's question, classifying the intent, extracting context, and deliberating.
 // Gracefully degrades to direct LLM deliberation on any Redis cache errors, OOM, or circuit breaker trips.
-func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	userID := middleware.GetUserID(r.Context())
-
-	// 0. Extract incoming W3C traceparent or initialize root HTTP span
-	ctx := r.Context()
-	if h.Tracer != nil {
-		ctx = h.Tracer.ExtractHTTPHeaders(ctx, r)
-	}
-
-	var rootSpan trace.Span
-	if h.Tracer != nil {
-		ctx, rootSpan = h.Tracer.StartSpan(ctx, "HTTP POST /api/v1/query",
-			trace.WithSpanKind(trace.SpanKindServer),
-			trace.WithAttributes(
-				attribute.String("http.method", r.Method),
-				attribute.String("http.route", "/api/v1/query"),
-			),
-		)
-		defer rootSpan.End()
-	}
-
-	// Propagate trace IDs in response headers
-	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
-		w.Header().Set("X-Trace-ID", sc.TraceID().String())
-		w.Header().Set("traceparent", fmt.Sprintf("00-%s-%s-%s", sc.TraceID().String(), sc.SpanID().String(), sc.TraceFlags().String()))
-	}
-	r = r.WithContext(ctx)
-
-	// 1. Request Validation (returns HTTP 400 JSON before any stream headers)
+func (h *Handlers) validateQueryRequest(w http.ResponseWriter, r *http.Request, rootSpan trace.Span) (*QueryRequest, bool) {
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		if rootSpan != nil {
@@ -109,7 +80,7 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusBadRequest))
 		}
 		jsonError(w, "invalid request body", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if req.Question == "" {
 		if rootSpan != nil {
@@ -117,7 +88,7 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusBadRequest))
 		}
 		jsonError(w, "question is required", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if len(req.Question) > 10000 {
 		if rootSpan != nil {
@@ -125,335 +96,420 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusBadRequest))
 		}
 		jsonError(w, "question exceeds maximum allowed length of 10000 characters", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if req.TopK <= 0 {
 		req.TopK = 5
 	}
+	return &req, true
+}
 
-	hasDocument := req.DocID != ""
-	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.Question)))[:16]
-
-	// 2. Content Negotiation
-	sseMode := isSSE(r)
-	if rootSpan != nil {
-		rootSpan.SetAttributes(
-			attribute.String("query.doc_id", req.DocID),
-			attribute.String("query.user_id", userID),
-			attribute.Int("query.top_k", req.TopK),
-			attribute.Bool("query.sse", sseMode),
-			attribute.Bool("query.sse_mode", sseMode),
-			attribute.Bool("query.has_document", hasDocument),
+func (h *Handlers) tryL1CacheLookup(
+	ctx context.Context,
+	w http.ResponseWriter,
+	rootSpan trace.Span,
+	req *QueryRequest,
+	cacheKey, queryHash, userID string,
+	start time.Time,
+	sseMode bool,
+	flusher http.Flusher,
+) bool {
+	if h.Cache == nil {
+		return false
+	}
+	var l1Span trace.Span
+	l1Ctx := ctx
+	if h.Tracer != nil {
+		l1Ctx, l1Span = h.Tracer.StartSpan(ctx, "cache.l1_lookup",
+			trace.WithSpanKind(trace.SpanKindInternal),
+			trace.WithAttributes(
+				attribute.String("cache.tier", "l1_exact"),
+				attribute.String("cache.key", cacheKey),
+				attribute.String("cache.doc_id", req.DocID),
+			),
 		)
 	}
-
-	var flusher http.Flusher
-	if sseMode {
-		var ok bool
-		flusher, ok = w.(http.Flusher)
-		if !ok {
-			if rootSpan != nil {
-				rootSpan.SetStatus(codes.Error, "streaming unsupported")
-				rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusInternalServerError))
-			}
-			jsonError(w, "streaming unsupported", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
-	}
-
-	// 3. L1 Exact Match Cache lookup (1ms Redis GET, 0ms embedding overhead).
-	cacheKey := fmt.Sprintf("cache:%s:%s", req.DocID, req.Question)
 	var cachedResponse QueryResponse
-	if h.Cache != nil {
-		var l1Span trace.Span
-		l1Ctx := ctx
-		if h.Tracer != nil {
-			l1Ctx, l1Span = h.Tracer.StartSpan(ctx, "cache.l1_lookup",
-				trace.WithSpanKind(trace.SpanKindInternal),
-				trace.WithAttributes(
-					attribute.String("cache.tier", "l1_exact"),
-					attribute.String("cache.key", cacheKey),
-					attribute.String("cache.doc_id", req.DocID),
-				),
-			)
-		}
-		found, err := h.Cache.Get(l1Ctx, cacheKey, &cachedResponse)
-		if l1Span != nil {
-			if err != nil {
-				l1Span.RecordError(err)
-				l1Span.SetStatus(codes.Error, err.Error())
-			} else {
-				l1Span.SetAttributes(attribute.Bool("cache.hit", found))
-				l1Span.SetStatus(codes.Ok, "")
-			}
-			l1Span.End()
-		}
+	found, err := h.Cache.Get(l1Ctx, cacheKey, &cachedResponse)
+	if l1Span != nil {
 		if err != nil {
-			if !errors.Is(err, cache.ErrCircuitOpen) {
-				log.Printf("[Query] L1 exact cache get warning: %v, proceeding to L2/deliberation", err)
-			}
-		} else if found {
-			if rootSpan != nil {
-				rootSpan.SetAttributes(
-					attribute.Bool("query.cache_hit", true),
-					attribute.String("query.cache_tier", "l1_exact"),
-					attribute.Int("http.status_code", http.StatusOK),
-				)
-				rootSpan.SetStatus(codes.Ok, "")
-			}
-			cachedResponse.CacheHit = true
-			cachedResponse.Latency = time.Since(start).String()
-			if h.Audit != nil {
-				h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "redis_exact_cache_hit")
-			}
-
-			if sseMode {
-				_ = writeSSE(w, flusher, "final_answer", cachedResponse)
-				return
-			}
-			jsonResponse(w, cachedResponse)
-			return
-		}
-	}
-
-	// 4. L2 Semantic Vector Cache lookup (RediSearch VSS).
-	var vector []float32
-	if hasDocument && h.SemanticCache != nil {
-		var err error
-		vector, err = h.getEmbedding(ctx, req.Question)
-		if err != nil {
-			log.Printf("[Query] Failed to get embedding for semantic cache: %v, proceeding to deliberation", err)
-		} else if len(vector) == 384 {
-			var l2Span trace.Span
-			l2Ctx := ctx
-			if h.Tracer != nil {
-				l2Ctx, l2Span = h.Tracer.StartSpan(ctx, "cache.l2_lookup",
-					trace.WithSpanKind(trace.SpanKindInternal),
-					trace.WithAttributes(
-						attribute.String("cache.tier", "l2_semantic"),
-						attribute.String("cache.doc_id", req.DocID),
-						attribute.Float64("cache.threshold", float64(h.SemanticCacheThreshold)),
-					),
-				)
-			}
-			var semCachedResponse QueryResponse
-			found, semErr := h.SemanticCache.Get(l2Ctx, req.DocID, vector, h.SemanticCacheThreshold, &semCachedResponse)
-			if l2Span != nil {
-				if semErr != nil {
-					l2Span.RecordError(semErr)
-					l2Span.SetStatus(codes.Error, semErr.Error())
-				} else {
-					l2Span.SetAttributes(attribute.Bool("cache.hit", found))
-					l2Span.SetStatus(codes.Ok, "")
-				}
-				l2Span.End()
-			}
-			if semErr != nil {
-				if !errors.Is(semErr, cache.ErrCircuitOpen) {
-					log.Printf("[Query] L2 semantic cache get warning: %v, proceeding to deliberation", semErr)
-				}
-			} else if found {
-				if rootSpan != nil {
-					rootSpan.SetAttributes(
-						attribute.Bool("query.cache_hit", true),
-						attribute.String("query.cache_tier", "l2_semantic"),
-						attribute.Int("http.status_code", http.StatusOK),
-					)
-					rootSpan.SetStatus(codes.Ok, "")
-				}
-				semCachedResponse.CacheHit = true
-				semCachedResponse.Latency = time.Since(start).String()
-				if h.Audit != nil {
-					h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "semantic_cache_hit")
-				}
-
-				if sseMode {
-					_ = writeSSE(w, flusher, "final_answer", semCachedResponse)
-					return
-				}
-				jsonResponse(w, semCachedResponse)
-				return
-			}
+			l1Span.RecordError(err)
+			l1Span.SetStatus(codes.Error, err.Error())
 		} else {
-			log.Printf("[Query] Embedding vector dimension mismatch (got %d, expected 384), proceeding to deliberation", len(vector))
+			l1Span.SetAttributes(attribute.Bool("cache.hit", found))
+			l1Span.SetStatus(codes.Ok, "")
 		}
+		l1Span.End()
+	}
+	if err != nil {
+		if !errors.Is(err, cache.ErrCircuitOpen) {
+			log.Printf("[Query] L1 exact cache get warning: %v, proceeding to L2/deliberation", err)
+		}
+		return false
+	}
+	if !found {
+		return false
 	}
 
-	// 5. Fetch conversation turns.
-	var history []council.ConversationTurn
-	if req.SessionID != "" && h.Memory != nil {
-		turns, err := h.Memory.GetHistory(ctx, userID, req.SessionID, 5)
-		if err != nil {
-			log.Printf("[Query] Failed to get conversation history: %v", err)
+	if rootSpan != nil {
+		rootSpan.SetAttributes(
+			attribute.Bool("query.cache_hit", true),
+			attribute.String("query.cache_tier", "l1_exact"),
+			attribute.Int("http.status_code", http.StatusOK),
+		)
+		rootSpan.SetStatus(codes.Ok, "")
+	}
+	cachedResponse.CacheHit = true
+	cachedResponse.Latency = time.Since(start).String()
+	if h.Audit != nil {
+		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "redis_exact_cache_hit")
+	}
+
+	if sseMode {
+		_ = writeSSE(w, flusher, "final_answer", cachedResponse)
+	} else {
+		jsonResponse(w, cachedResponse)
+	}
+	return true
+}
+
+func (h *Handlers) tryL2CacheLookup(
+	ctx context.Context,
+	w http.ResponseWriter,
+	rootSpan trace.Span,
+	req *QueryRequest,
+	queryHash, userID string,
+	start time.Time,
+	sseMode bool,
+	flusher http.Flusher,
+) (bool, []float32) {
+	if req.DocID == "" || h.SemanticCache == nil {
+		return false, nil
+	}
+	vector, err := h.getEmbedding(ctx, req.Question)
+	if err != nil {
+		log.Printf("[Query] Failed to get embedding for semantic cache: %v, proceeding to deliberation", err)
+		return false, nil
+	}
+	if len(vector) != 384 {
+		log.Printf("[Query] Embedding vector dimension mismatch (got %d, expected 384), proceeding to deliberation", len(vector))
+		return false, vector
+	}
+
+	var l2Span trace.Span
+	l2Ctx := ctx
+	if h.Tracer != nil {
+		l2Ctx, l2Span = h.Tracer.StartSpan(ctx, "cache.l2_lookup",
+			trace.WithSpanKind(trace.SpanKindInternal),
+			trace.WithAttributes(
+				attribute.String("cache.tier", "l2_semantic"),
+				attribute.String("cache.doc_id", req.DocID),
+				attribute.Float64("cache.threshold", float64(h.SemanticCacheThreshold)),
+			),
+		)
+	}
+	var semCachedResponse QueryResponse
+	found, semErr := h.SemanticCache.Get(l2Ctx, req.DocID, vector, h.SemanticCacheThreshold, &semCachedResponse)
+	if l2Span != nil {
+		if semErr != nil {
+			l2Span.RecordError(semErr)
+			l2Span.SetStatus(codes.Error, semErr.Error())
 		} else {
-			for _, t := range turns {
-				history = append(history, council.ConversationTurn{
-					Role:    t.Role,
-					Content: t.Content,
-				})
-			}
+			l2Span.SetAttributes(attribute.Bool("cache.hit", found))
+			l2Span.SetStatus(codes.Ok, "")
 		}
+		l2Span.End()
+	}
+	if semErr != nil {
+		if !errors.Is(semErr, cache.ErrCircuitOpen) {
+			log.Printf("[Query] L2 semantic cache get warning: %v, proceeding to deliberation", semErr)
+		}
+		return false, vector
+	}
+	if !found {
+		return false, vector
 	}
 
-	// 6. Deliberation Strategy Planning
+	if rootSpan != nil {
+		rootSpan.SetAttributes(
+			attribute.Bool("query.cache_hit", true),
+			attribute.String("query.cache_tier", "l2_semantic"),
+			attribute.Int("http.status_code", http.StatusOK),
+		)
+		rootSpan.SetStatus(codes.Ok, "")
+	}
+	semCachedResponse.CacheHit = true
+	semCachedResponse.Latency = time.Since(start).String()
+	if h.Audit != nil {
+		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "semantic_cache_hit")
+	}
+
+	if sseMode {
+		_ = writeSSE(w, flusher, "final_answer", semCachedResponse)
+	} else {
+		jsonResponse(w, semCachedResponse)
+	}
+	return true, vector
+}
+
+func (h *Handlers) getConversationHistory(ctx context.Context, sessionID, userID string) []council.ConversationTurn {
+	if sessionID == "" || h.Memory == nil {
+		return nil
+	}
+	turns, err := h.Memory.GetHistory(ctx, userID, sessionID, 5)
+	if err != nil {
+		log.Printf("[Query] Failed to get conversation history: %v", err)
+		return nil
+	}
+	history := make([]council.ConversationTurn, 0, len(turns))
+	for _, t := range turns {
+		history = append(history, council.ConversationTurn{
+			Role:    t.Role,
+			Content: t.Content,
+		})
+	}
+	return history
+}
+
+func (h *Handlers) resolveQueryPlan(ctx context.Context, question, docID string) *agent.QueryPlan {
+	hasDocument := docID != ""
 	var docSummary string
 	if hasDocument && h.Cache != nil {
-		if found, err := h.Cache.Get(ctx, "doc_summary:"+req.DocID, &docSummary); err != nil {
+		if found, err := h.Cache.Get(ctx, "doc_summary:"+docID, &docSummary); err != nil {
 			if !errors.Is(err, cache.ErrCircuitOpen) {
-				log.Printf("[Query] Failed to get doc_summary from cache for %s: %v", req.DocID, err)
+				log.Printf("[Query] Failed to get doc_summary from cache for %s: %v", docID, err)
 			}
 		} else if !found {
-			log.Printf("[Query] Document summary not found in cache for %s", req.DocID)
+			log.Printf("[Query] Document summary not found in cache for %s", docID)
 		}
 	}
 
-	var plan *agent.QueryPlan
 	if h.Router != nil {
-		var err error
-		plan, err = h.Router.Plan(ctx, req.Question, docSummary)
-		if err != nil {
-			log.Printf("[Query] Router failed: %v, defaulting to council", err)
-			plan = &agent.QueryPlan{Strategy: "council", NeedsDoc: hasDocument}
+		plan, err := h.Router.Plan(ctx, question, docSummary)
+		if err == nil {
+			return plan
 		}
-	} else {
-		plan = &agent.QueryPlan{Strategy: "council", NeedsDoc: hasDocument}
+		log.Printf("[Query] Router failed: %v, defaulting to council", err)
 	}
+	return &agent.QueryPlan{Strategy: "council", NeedsDoc: hasDocument}
+}
 
-	// 7. Context Retrieval
-	var chunks []string
-	if plan.NeedsDoc && hasDocument {
-		var err error
-		chunks, err = h.retrieveChunks(r.WithContext(ctx), req)
+func (h *Handlers) fetchQueryContext(ctx context.Context, r *http.Request, plan *agent.QueryPlan, req *QueryRequest) []string {
+	if plan.NeedsDoc && req.DocID != "" {
+		chunks, err := h.retrieveChunks(r.WithContext(ctx), *req)
 		if err != nil {
 			log.Printf("[Query] Retrieval failed: %v, falling back to general knowledge", err)
-			chunks = nil
+			return nil
 		}
-	} else if !hasDocument && h.HTTPClient != nil {
+		return chunks
+	}
+	if req.DocID == "" && h.HTTPClient != nil {
 		log.Printf("[Query] General query (no document), executing Web Search fallback...")
-		var err error
-		chunks, err = h.retrieveWebSearch(ctx, req.Question)
+		chunks, err := h.retrieveWebSearch(ctx, req.Question)
 		if err != nil {
 			log.Printf("[Query] Web search fallback failed: %v", err)
 		}
+		return chunks
 	}
+	return nil
+}
 
-	// 8. Deliberation Execution
-	councilStart := time.Now()
+func (h *Handlers) executeStreamingDeliberation(
+	ctx context.Context,
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	plan *agent.QueryPlan,
+	req *QueryRequest,
+	chunks []string,
+	history []council.ConversationTurn,
+) (*council.CouncilResult, error) {
+	eventChan := make(chan council.StreamEvent, 16)
+	doneChan := make(chan struct{})
+
 	var (
 		result     *council.CouncilResult
 		councilErr error
 	)
 
-	if sseMode {
-		eventChan := make(chan council.StreamEvent, 16)
-		doneChan := make(chan struct{})
-
-		go func(execCtx context.Context) {
-			defer close(doneChan)
-			if h.Council != nil {
-				switch plan.Strategy {
-				case "direct":
-					result, councilErr = h.Council.QueryDirectStream(execCtx, req.Question, chunks, history, eventChan)
-				case "council", "council_deep":
-					result, councilErr = h.Council.QueryStream(execCtx, req.Question, chunks, "", false, plan.Strategy, history, eventChan)
-				default:
-					result, councilErr = h.Council.QueryStream(execCtx, req.Question, chunks, "", false, "council", history, eventChan)
-				}
-			} else {
-				close(eventChan)
-				councilErr = fmt.Errorf("council orchestrator not initialized")
-			}
-		}(ctx)
-
-		// Event streaming loop with client disconnect handling
-	streamLoop:
-		for {
-			select {
-			case <-ctx.Done():
-				log.Printf("[Query] Client disconnected mid-stream: %v", ctx.Err())
-				return
-			case event, ok := <-eventChan:
-				if !ok {
-					break streamLoop
-				}
-				if writeErr := writeSSE(w, flusher, string(event.Type), event.Data); writeErr != nil {
-					log.Printf("[Query] Failed to write SSE frame: %v", writeErr)
-					return
-				}
-			}
-		}
-
-		<-doneChan
-
-		if councilErr != nil {
-			if rootSpan != nil {
-				rootSpan.RecordError(councilErr)
-				rootSpan.SetStatus(codes.Error, councilErr.Error())
-				rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusInternalServerError))
-			}
-			log.Printf("[Query] Council failed: %v", councilErr)
-			_ = writeSSE(w, flusher, "error", map[string]interface{}{
-				"code":    http.StatusInternalServerError,
-				"message": "LLM council failed",
-				"error":   councilErr.Error(),
-			})
-			if h.Audit != nil {
-				h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "council_error")
-			}
-			return
-		}
-	} else {
-		if h.Council != nil {
-			switch plan.Strategy {
-			case "direct":
-				result, councilErr = h.Council.QueryDirect(ctx, req.Question, chunks, history)
-			case "council", "council_deep":
-				result, councilErr = h.Council.Query(ctx, req.Question, chunks, "", false, plan.Strategy, history)
-			default:
-				result, councilErr = h.Council.Query(ctx, req.Question, chunks, "", false, "council", history)
-			}
-		} else {
+	go func(execCtx context.Context) {
+		defer close(doneChan)
+		if h.Council == nil {
+			close(eventChan)
 			councilErr = fmt.Errorf("council orchestrator not initialized")
+			return
 		}
+		switch plan.Strategy {
+		case "direct":
+			result, councilErr = h.Council.QueryDirectStream(execCtx, req.Question, chunks, history, eventChan)
+		case "council", "council_deep":
+			result, councilErr = h.Council.QueryStream(execCtx, req.Question, chunks, "", false, plan.Strategy, history, eventChan)
+		default:
+			result, councilErr = h.Council.QueryStream(execCtx, req.Question, chunks, "", false, "council", history, eventChan)
+		}
+	}(ctx)
 
-		if councilErr != nil {
-			if rootSpan != nil {
-				rootSpan.RecordError(councilErr)
-				rootSpan.SetStatus(codes.Error, councilErr.Error())
-				rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusInternalServerError))
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[Query] Client disconnected mid-stream: %v", ctx.Err())
+			return nil, ctx.Err()
+		case event, ok := <-eventChan:
+			if !ok {
+				<-doneChan
+				return result, councilErr
 			}
-			log.Printf("[Query] Council failed: %v", councilErr)
-			jsonError(w, "LLM council failed", http.StatusInternalServerError)
-			if h.Audit != nil {
-				h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "council_error")
+			if writeErr := writeSSE(w, flusher, string(event.Type), event.Data); writeErr != nil {
+				log.Printf("[Query] Failed to write SSE frame: %v", writeErr)
+				return nil, nil
 			}
+		}
+	}
+}
+
+func (h *Handlers) executeDirectDeliberation(
+	ctx context.Context,
+	plan *agent.QueryPlan,
+	req *QueryRequest,
+	chunks []string,
+	history []council.ConversationTurn,
+) (*council.CouncilResult, error) {
+	if h.Council == nil {
+		return nil, fmt.Errorf("council orchestrator not initialized")
+	}
+	switch plan.Strategy {
+	case "direct":
+		return h.Council.QueryDirect(ctx, req.Question, chunks, history)
+	case "council", "council_deep":
+		return h.Council.Query(ctx, req.Question, chunks, "", false, plan.Strategy, history)
+	default:
+		return h.Council.Query(ctx, req.Question, chunks, "", false, "council", history)
+	}
+}
+
+func (h *Handlers) saveToCaches(
+	ctx context.Context,
+	req *QueryRequest,
+	cacheKey string,
+	vector []float32,
+	response QueryResponse,
+) {
+	if h.Cache != nil {
+		if err := h.Cache.Set(ctx, cacheKey, response); err != nil && !errors.Is(err, cache.ErrCircuitOpen) {
+			log.Printf("[Query] L1 exact cache set failed: %v", err)
+		}
+	}
+
+	if req.DocID == "" || h.SemanticCache == nil {
+		return
+	}
+	if len(vector) != 384 {
+		var err error
+		vector, err = h.getEmbedding(ctx, req.Question)
+		if err != nil {
+			log.Printf("[Query] Failed to get embedding for semantic cache put: %v", err)
 			return
 		}
 	}
+	if len(vector) == 384 {
+		if err := h.SemanticCache.Put(ctx, req.DocID, vector, response); err != nil && !errors.Is(err, cache.ErrCircuitOpen) {
+			log.Printf("[Query] L2 semantic cache put failed: %v", err)
+		}
+	}
+}
 
-	metrics.CouncilResponseTime.Observe(time.Since(councilStart).Seconds())
+func (h *Handlers) saveToMemory(ctx context.Context, sessionID, userID, question, answer string) {
+	if sessionID == "" || h.Memory == nil {
+		return
+	}
+	if err := h.Memory.Append(ctx, userID, sessionID, memory.Turn{Role: "user", Content: question}); err != nil {
+		log.Printf("[Query] Failed to append user turn to memory: %v", err)
+	}
+	if err := h.Memory.Append(ctx, userID, sessionID, memory.Turn{Role: "assistant", Content: answer}); err != nil {
+		log.Printf("[Query] Failed to append assistant turn to memory: %v", err)
+	}
+}
 
-	if rootSpan != nil {
-		rootSpan.SetAttributes(
-			attribute.String("query.strategy", result.Strategy),
-			attribute.Float64("query.confidence", result.Confidence),
-			attribute.Int("http.status_code", http.StatusOK),
-		)
-		rootSpan.SetStatus(codes.Ok, "")
+func (h *Handlers) initQueryTracing(w http.ResponseWriter, r *http.Request) (context.Context, trace.Span, func()) {
+	ctx := r.Context()
+	if h.Tracer != nil {
+		ctx = h.Tracer.ExtractHTTPHeaders(ctx, r)
 	}
 
+	var rootSpan trace.Span
+	cleanup := func() {}
+	if h.Tracer != nil {
+		ctx, rootSpan = h.Tracer.StartSpan(ctx, "HTTP POST /api/v1/query",
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(
+				attribute.String("http.method", r.Method),
+				attribute.String("http.route", "/api/v1/query"),
+			),
+		)
+		cleanup = func() { rootSpan.End() }
+	}
+
+	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
+		w.Header().Set("X-Trace-ID", sc.TraceID().String())
+		w.Header().Set("traceparent", fmt.Sprintf("00-%s-%s-%s", sc.TraceID().String(), sc.SpanID().String(), sc.TraceFlags().String()))
+	}
+	return ctx, rootSpan, cleanup
+}
+
+func (h *Handlers) setupSSEStream(w http.ResponseWriter, rootSpan trace.Span) (http.Flusher, bool) {
+	flusher, isFlusher := w.(http.Flusher)
+	if !isFlusher {
+		if rootSpan != nil {
+			rootSpan.SetStatus(codes.Error, "streaming unsupported")
+			rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusInternalServerError))
+		}
+		jsonError(w, "streaming unsupported", http.StatusInternalServerError)
+		return nil, false
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	return flusher, true
+}
+
+func (h *Handlers) handleCouncilFailure(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	rootSpan trace.Span,
+	councilErr error,
+	sseMode bool,
+	userID, docID, queryHash string,
+	start time.Time,
+) {
+	if rootSpan != nil {
+		rootSpan.RecordError(councilErr)
+		rootSpan.SetStatus(codes.Error, councilErr.Error())
+		rootSpan.SetAttributes(attribute.Int("http.status_code", http.StatusInternalServerError))
+	}
+	log.Printf("[Query] Council failed: %v", councilErr)
+	if sseMode {
+		_ = writeSSE(w, flusher, "error", map[string]interface{}{
+			"code":    http.StatusInternalServerError,
+			"message": "LLM council failed",
+			"error":   councilErr.Error(),
+		})
+	} else {
+		jsonError(w, "LLM council failed", http.StatusInternalServerError)
+	}
+	if h.Audit != nil {
+		h.Audit.LogQuery(userID, docID, queryHash, time.Since(start), "council_error")
+	}
+}
+
+func (h *Handlers) buildQueryResponse(result *council.CouncilResult, start time.Time) QueryResponse {
 	candidateList := result.CandidateAnswers
 	if len(candidateList) == 0 && len(result.Candidates) > 0 {
 		candidateList = result.Candidates
 	}
 
-	response := QueryResponse{
+	return QueryResponse{
 		Answer:       result.FinalAnswer,
 		Confidence:   result.Confidence,
 		Source:       result.Source,
@@ -465,54 +521,100 @@ func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		Latency:      time.Since(start).String(),
 		CacheHit:     false,
 	}
+}
 
-	// 9. Side Effects (L1 Exact Cache, L2 Semantic Cache, Memory, Audit)
-	// Degradation guarantee: Any cache or memory write error must not fail the request.
-	if h.Cache != nil {
-		if err := h.Cache.Set(ctx, cacheKey, response); err != nil {
-			if !errors.Is(err, cache.ErrCircuitOpen) {
-				log.Printf("[Query] L1 exact cache set failed: %v", err)
-			}
+func (h *Handlers) HandleQuery(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	userID := middleware.GetUserID(r.Context())
+
+	// 0. Extract incoming W3C traceparent or initialize root HTTP span
+	ctx, rootSpan, endSpan := h.initQueryTracing(w, r)
+	defer endSpan()
+	r = r.WithContext(ctx)
+
+	// 1. Request Validation
+	req, ok := h.validateQueryRequest(w, r, rootSpan)
+	if !ok {
+		return
+	}
+
+	queryHash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.Question)))[:16]
+	sseMode := isSSE(r)
+	if rootSpan != nil {
+		rootSpan.SetAttributes(
+			attribute.String("query.doc_id", req.DocID),
+			attribute.String("query.user_id", userID),
+			attribute.Int("query.top_k", req.TopK),
+			attribute.Bool("query.sse", sseMode),
+			attribute.Bool("query.sse_mode", sseMode),
+			attribute.Bool("query.has_document", req.DocID != ""),
+		)
+	}
+
+	var flusher http.Flusher
+	if sseMode {
+		var sseOk bool
+		flusher, sseOk = h.setupSSEStream(w, rootSpan)
+		if !sseOk {
+			return
 		}
 	}
 
-	if hasDocument && h.SemanticCache != nil {
-		if len(vector) != 384 {
-			var err error
-			vector, err = h.getEmbedding(ctx, req.Question)
-			if err != nil {
-				log.Printf("[Query] Failed to get embedding for semantic cache put: %v", err)
-			}
-		}
-		if len(vector) == 384 {
-			if err := h.SemanticCache.Put(ctx, req.DocID, vector, response); err != nil {
-				if !errors.Is(err, cache.ErrCircuitOpen) {
-					log.Printf("[Query] L2 semantic cache put failed: %v", err)
-				}
-			}
-		}
+	// 2. L1 Exact Match Cache & L2 Semantic Cache
+	cacheKey := fmt.Sprintf("cache:%s:%s", req.DocID, req.Question)
+	if h.tryL1CacheLookup(ctx, w, rootSpan, req, cacheKey, queryHash, userID, start, sseMode, flusher) {
+		return
+	}
+	hitL2, vector := h.tryL2CacheLookup(ctx, w, rootSpan, req, queryHash, userID, start, sseMode, flusher)
+	if hitL2 {
+		return
 	}
 
-	if req.SessionID != "" && h.Memory != nil {
-		if err := h.Memory.Append(ctx, userID, req.SessionID, memory.Turn{
-			Role:    "user",
-			Content: req.Question,
-		}); err != nil {
-			log.Printf("[Query] Failed to append user turn to memory: %v", err)
+	// 3. Conversation History & Plan
+	history := h.getConversationHistory(ctx, req.SessionID, userID)
+	plan := h.resolveQueryPlan(ctx, req.Question, req.DocID)
+	chunks := h.fetchQueryContext(ctx, r, plan, req)
+
+	// 4. Deliberation Execution
+	councilStart := time.Now()
+	var (
+		result     *council.CouncilResult
+		councilErr error
+	)
+
+	if sseMode {
+		result, councilErr = h.executeStreamingDeliberation(ctx, w, flusher, plan, req, chunks, history)
+		if ctx.Err() != nil || (result == nil && councilErr == nil) {
+			return
 		}
-		if err := h.Memory.Append(ctx, userID, req.SessionID, memory.Turn{
-			Role:    "assistant",
-			Content: result.FinalAnswer,
-		}); err != nil {
-			log.Printf("[Query] Failed to append assistant turn to memory: %v", err)
-		}
+	} else {
+		result, councilErr = h.executeDirectDeliberation(ctx, plan, req, chunks, history)
 	}
 
+	if councilErr != nil {
+		h.handleCouncilFailure(w, flusher, rootSpan, councilErr, sseMode, userID, req.DocID, queryHash, start)
+		return
+	}
+
+	metrics.CouncilResponseTime.Observe(time.Since(councilStart).Seconds())
+	if rootSpan != nil {
+		rootSpan.SetAttributes(
+			attribute.String("query.strategy", result.Strategy),
+			attribute.Float64("query.confidence", result.Confidence),
+			attribute.Int("http.status_code", http.StatusOK),
+		)
+		rootSpan.SetStatus(codes.Ok, "")
+	}
+
+	response := h.buildQueryResponse(result, start)
+
+	// 5. Side Effects (Caches, Memory, Audit)
+	h.saveToCaches(ctx, req, cacheKey, vector, response)
+	h.saveToMemory(ctx, req.SessionID, userID, req.Question, result.FinalAnswer)
 	if h.Audit != nil {
 		h.Audit.LogQuery(userID, req.DocID, queryHash, time.Since(start), "success")
 	}
 
-	// 10. Non-streaming JSON mode final output
 	if !sseMode {
 		jsonResponse(w, response)
 	}
