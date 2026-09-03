@@ -48,11 +48,14 @@ graph TB
     subgraph Go["Go Control Plane (Port 8080)"]
         Router["Chi Router"]
         MW["Middleware Stack<br/>RequestID → RealIP →<br/>Logging → Recoverer → CORS"]
+        OTel["OpenTelemetry Tracer<br/>(W3C traceparent)"]
         Auth["JWT Auth Middleware"]
+        UserRepo["UserRepository<br/>(PostgreSQL + Memory Fallback)"]
         RL["Redis Rate Limiter<br/>(sliding window)"]
-        Handlers["Request Handlers<br/>query / ingest / explain /<br/>generate-questions"]
+        Breaker["Redis Circuit Breaker<br/>(fail-fast 81ns)"]
+        Handlers["Request Handlers<br/>query (SSE + JSON) / ingest /<br/>explain / generate-questions"]
         RouterAgent["Router Agent<br/>(intent routing)"]
-        Council["Multi-Agent Council<br/>(Deliberation Pipeline)"]
+        Council["Multi-Agent Council<br/>(Streaming Deliberation)"]
         Reflect["Self-Reflection Agent<br/>(Revision Loop)"]
         Cache["Exact Key Cache (L1)<br/>(Redis GET 1ms)"]
         SemCache["Semantic Vector Cache (L2)<br/>(Redis Stack RediSearch VSS)"]
@@ -78,21 +81,23 @@ graph TB
     end
 
     subgraph Infra["Infrastructure"]
-        Redis[("Redis Stack Server<br/>(VSS + cache + rate limit)")]
+        Postgres[("PostgreSQL 16<br/>(persistent users)")]
+        Redis[("Redis Stack Server<br/>(VSS + volatile-lru + rate limit)")]
         Prom["Prometheus<br/>(Port 9091)"]
         Grafana["Grafana<br/>(Port 3000)"]
     end
 
     Streamlit --> Router
     cURL --> Router
-    Router --> MW --> Auth --> RL --> Handlers
-    Handlers -->|1. Exact Match Check (0ms embedding)| Cache
+    Router --> MW --> OTel --> Auth --> RL --> Handlers
+    Auth --> UserRepo --> Postgres
+    Handlers -->|1. Exact Match Check (0ms embedding)| Breaker --> Cache
     Cache -->|miss| SemCache
     SemCache -->|2. Vector VSS Check (miss)| RouterAgent
     RouterAgent -->|direct mode| Gemini
     RouterAgent -->|council mode| Council
     Council -->|retrieve chunks / web search| Python
-    Council -->|fan-out 3x| OR & vLLM
+    Council -->|fan-out 3x stream| OR & vLLM
     Council -->|synthesize| Gemini
     Gemini -->|deep mode| Reflect
     Reflect -->|needs revision| Gemini
@@ -113,13 +118,14 @@ graph TB
 
 ### 3.2 Service Boundaries
 
-| Service | Language | Port | Responsibility |
-|---------|----------|------|----------------|
-| **Go Backend** | Go 1.22 | 8080 | API gateway, auth, caching, LLM orchestration, metrics |
-| **Python RAG** | Python 3.11 | 8000 | Document processing, OCR, chunking, embedding, retrieval |
-| **Redis** | — | 6379 | Cache (1h TTL) + per-user rate limiting |
-| **Prometheus** | — | 9091 | Metrics collection |
-| **Grafana** | — | 3000 | Pre-built dashboards |
+| Service | Technology | Port | Responsibility |
+|---------|------------|------|----------------|
+| **Go Backend** | Go 1.22 (`CGO_ENABLED=0`) | 8080 | API gateway, auth, SSE streaming, circuit breaking, OTel tracing, LLM orchestration, metrics |
+| **Python RAG** | Python 3.11 / FastAPI | 8000 | Document processing, OCR routing, layout chunking, batch embeddings, ChromaDB retrieval |
+| **PostgreSQL** | PostgreSQL 16 (Alpine) | 5432 | Persistent user credentials, bcrypt verification, connection pooling (`jackc/pgx/v5`) |
+| **Redis Stack** | Redis Stack Server 7.2 | 6379 | L1 exact cache, L2 RediSearch VSS semantic cache, `volatile-lru` eviction, rate limiting, session turns |
+| **Prometheus** | Prometheus | 9091 | Time-series metrics scraping and alerting |
+| **Grafana** | Grafana | 3000 | Pre-provisioned dashboards for CouncilAI latency, cache hits, and RED metrics |
 
 ---
 
@@ -277,14 +283,56 @@ sequenceDiagram
     - *Cons*: Concurrent scraping requests temporarily allocate memory for parsed BeautifulSoup DOM trees.
   - **Scaling**:
     - *Pros*: Enables real-time web search fallback for general queries without document context.
-    - *Cons*: Susceptible to IP rate limits or HTTP 429 blocking if query volume is high from a single server IP.
-* **Pros**:
-  - **Lightweight Footprint**: Consumes $<5\text{ MB}$ RAM per scrape, eliminating $>500\text{ MB}$ Chromium/Playwright container binaries.
-  - **Low Latency HTML Parsing**: Extracts `<p>` paragraphs in $<5\text{ ms}$ after HTTP fetch.
-  - **Zero Subscription Costs**: Eliminates monthly API key requirements for web search grounding.
-* **Cons**:
-  - **No Client-Side JS Rendering**: Cannot scrape single-page applications (React/Vue/Angular) requiring JavaScript execution.
-  - **Rate Limit & Layout Susceptibility**: Vulnerable to target website HTML changes, rate limits, or anti-bot Cloudflare checks.
+
+#### Decision 5: Server-Sent Events (SSE) Streaming vs. WebSockets / Polling
+* **Context**: Eliminating the 4-8 second blocking latency cliff for multi-agent deliberation queries.
+* **Final Selection**: **Server-Sent Events (SSE) via HTTP Content Negotiation (`Accept: text/event-stream`)**.
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: HTTP standard, unidirectional stream utilizing standard `http.Flusher`. Backward compatible with `application/json`.
+    - *Cons*: Unidirectional (client cannot send cancel/steer signals over the same channel without opening a new HTTP request).
+  - **Latency**:
+    - *Pros*: Slashes Time-To-First-Token (TTFT) from $4.5\text{s}$ down to $<100\text{ms}$ ($15.27\text{ms}$ measured) by emitting individual candidate drafts as soon as each model completes.
+    - *Cons*: Network connection remains open throughout the multi-step deliberation pipeline.
+  - **Memory & Concurrency**:
+    - *Pros*: Goroutine and memory footprint are identical to standard HTTP requests.
+    - *Cons*: Client disconnections require strict context cancellation to avoid orphaned goroutines.
+
+#### Decision 6: PostgreSQL Database for Persistent Auth vs. In-Memory Map
+* **Context**: Making the Go API control plane 100% stateless across container restarts and horizontal replica scaling.
+* **Final Selection**: **PostgreSQL 16 with `pgxpool` Connection Pooling (`jackc/pgx/v5`)**.
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: Decoupled behind `UserRepository` interface with automated schema creation and bcrypt password hashing.
+    - *Cons*: Adds a relational database dependency to the infrastructure compose stack.
+  - **Scaling**:
+    - *Pros*: Any number of Go backend replicas can run statelessly behind a load balancer without user session divergence.
+    - *Cons*: Requires managing connection pool limits (`MaxConns`) under heavy horizontal scale.
+  - **Testing**:
+    - *Pros*: Accompanied by thread-safe `MemoryUserRepository` allowing unit tests to execute in sub-millisecond time offline.
+    - *Cons*: Integration tests require a live Postgres container or test database URL.
+
+#### Decision 7: Redis Circuit Breaker & `volatile-lru` Eviction for Memory Protection
+* **Context**: Protecting the control plane from Redis memory exhaustion (OOM) or network socket dropouts.
+* **Final Selection**: **Thread-safe Circuit Breaker (`Closed -> Open -> Half-Open -> Closed`) + `--maxmemory-policy volatile-lru`**.
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: In an open state, calls fail fast in $81\text{ns/op}$, completely skipping dead network calls. All cache and memory write errors gracefully fall back to direct LLM execution without failing user queries.
+    - *Cons*: Temporary cache misses during circuit trips increase downstream LLM token usage.
+  - **Resilience**:
+    - *Pros*: Prevents Redis crashes or memory pressure from bringing down the entire API gateway.
+    - *Cons*: Requires careful tuning of failure/success thresholds and half-open probe concurrency.
+
+#### Decision 8: OpenTelemetry Distributed Tracing with W3C Trace Context
+* **Context**: Diagnosing multi-service tail latency regressions across Go orchestration, Python RAG, Redis, and LLMs.
+* **Final Selection**: **OpenTelemetry SDK (`go.opentelemetry.io/otel`) with W3C `traceparent` Header Injection/Extraction**.
+* **Trade-off Analysis across Technical Axes**:
+  - **Technical Design**:
+    - *Pros*: Industry-standard vendor-neutral instrumentation. Automatically propagates trace IDs across HTTP boundaries (`X-Trace-ID`, `traceparent`).
+    - *Cons*: Requires propagating `context.Context` rigorously across all function signatures and HTTP client calls.
+  - **Observability**:
+    - *Pros*: Provides end-to-end visibility across: `[HTTP Request] ──► [L1 Cache] ──► [Python /embed] ──► [L2 RediSearch] ──► [Fan-Out] ──► [Chairman Deliberation]`.
+    - *Cons*: Adds microsecond-level CPU overhead per span creation.
 
 ---
 
@@ -328,9 +376,9 @@ sequenceDiagram
 
 ### 6.3 Resolved & Engineering Gaps
 
-#### Gap 1: In-Memory User Ephemerality
-* **Description**: User accounts were stored in-memory in `auth.go`. A server restart wiped the map, forcing user re-registration.
-* **Solution**: (Planned) Refactor user store to Redis Hash / SQLite persistence.
+#### Gap 1: In-Memory User Ephemerality [RESOLVED]
+* **Description**: User accounts were previously stored in-memory in `auth.go`. A server restart wiped the map, forcing user re-registration.
+* **Solution**: Migrated to PostgreSQL 16 (`PostgresUserRepository`) with connection pooling (`jackc/pgx/v5`), auto-migration of `users` table, and bcrypt password hashing, with a thread-safe `MemoryUserRepository` fallback for isolated unit testing.
 
 #### Gap 2: CGo Toolchain & AVX2 Lock-in [RESOLVED]
 * **Description**: CGo bindings and AVX2 intrinsics created cross-compilation friction on ARM64 / Apple Silicon.
@@ -344,6 +392,6 @@ sequenceDiagram
 * **Description**: Go backend logged an empty string in `h.Audit.LogIngest`.
 * **Solution**: Unmarshaled the `/ingest` response in `ingest.go` to capture the generated `doc_id`.
 
-#### Gap 5: Go/Python Context Propagation
-* **Description**: Context cancellation in the Go backend (client disconnect) was not fully propagated to Python RAG service during long ingestion or retrieval tasks.
-* **Solution**: Pass Go request context via HTTP request context to cancel orphaned Python requests.
+#### Gap 5: Go/Python Context & Trace Propagation [RESOLVED]
+* **Description**: Context cancellation in the Go backend (client disconnect) was not fully propagated to Python RAG service during long ingestion or retrieval tasks, and distributed tracing spans were missing.
+* **Solution**: Implemented OpenTelemetry distributed tracing (`internal/telemetry`) injecting W3C `traceparent` headers into outbound HTTP calls (`/embed`, `/retrieve-all`, `/search`) and propagating cancellation contexts down to all workers.
