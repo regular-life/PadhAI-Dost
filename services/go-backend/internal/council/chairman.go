@@ -62,6 +62,7 @@ Respond ONLY in JSON format:
 
 // chairmanSynthesize calls the chairman model to produce a synthesized answer.
 func (o *Orchestrator) chairmanSynthesize(
+	ctx context.Context,
 	question string,
 	chunks []string,
 	candidates []CandidateAnswer,
@@ -103,10 +104,13 @@ Peer Reviews:
 		reviewsText,
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), o.stageTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx, cancel := context.WithTimeout(ctx, o.stageTimeout)
 	defer cancel()
 
-	resp, err := o.chairmanClient.GenerateChat(ctx, llm.GenerateOptions{
+	resp, err := o.chairmanClient.GenerateChat(callCtx, llm.GenerateOptions{
 		Messages: []llm.Message{
 			{Role: "system", Content: chairmanSystemPrompt},
 			{Role: "user", Content: userMsg},

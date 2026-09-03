@@ -20,6 +20,22 @@ redis:
   addr: "redis:6379"
   password: ""
   db: 0
+  circuit_breaker_failure_threshold: 3
+  circuit_breaker_success_threshold: 2
+  circuit_breaker_timeout: "10s"
+
+database:
+  url: "postgres://council_user:council_pass@postgres:5432/council_db?sslmode=disable"
+  host: "postgres"
+  port: "5432"
+  user: "council_user"
+  password: "council_pass"
+  dbname: "council_db"
+  sslmode: "disable"
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: "1h"
+  conn_max_idle_time: "30m"
 
 providers:
   openrouter_url: "https://openrouter.ai/api/v1/chat/completions"

@@ -47,7 +47,18 @@ func (h *Handlers) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	writer.Close()
 
-	resp, err := h.HTTPClient.Post(h.RAGServiceURL+"/ingest", writer.FormDataContentType(), &buf)
+	httpReq, err := http.NewRequestWithContext(r.Context(), "POST", h.RAGServiceURL+"/ingest", &buf)
+	if err != nil {
+		log.Printf("[Ingest] Failed to create request: %v", err)
+		jsonError(w, "failed to create request", http.StatusInternalServerError)
+		return
+	}
+	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
+	if h.Tracer != nil {
+		h.Tracer.InjectHTTPHeaders(r.Context(), httpReq)
+	}
+
+	resp, err := h.HTTPClient.Do(httpReq)
 	if err != nil {
 		log.Printf("[Ingest] Failed to contact RAG service: %v", err)
 		jsonError(w, "RAG service unavailable", http.StatusServiceUnavailable)
@@ -104,7 +115,14 @@ func (h *Handlers) HandleHealth(w http.ResponseWriter, r *http.Request) {
 		status["redis"] = "healthy"
 	}
 
-	resp, err := h.HTTPClient.Get(h.RAGServiceURL + "/health")
+	httpReq, err := http.NewRequestWithContext(r.Context(), "GET", h.RAGServiceURL+"/health", nil)
+	var resp *http.Response
+	if err == nil {
+		if h.Tracer != nil {
+			h.Tracer.InjectHTTPHeaders(r.Context(), httpReq)
+		}
+		resp, err = h.HTTPClient.Do(httpReq)
+	}
 	if err != nil || resp.StatusCode != 200 {
 		status["rag_service"] = "unhealthy"
 	} else {

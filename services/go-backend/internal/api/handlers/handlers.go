@@ -16,6 +16,10 @@ import (
 	"github.com/regular-life/CouncilAI/go-backend/internal/cache"
 	"github.com/regular-life/CouncilAI/go-backend/internal/council"
 	"github.com/regular-life/CouncilAI/go-backend/internal/memory"
+	"github.com/regular-life/CouncilAI/go-backend/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Handlers encapsulates all system dependencies for the REST API endpoints.
@@ -30,6 +34,7 @@ type Handlers struct {
 	Memory                 *memory.ConversationStore
 	HTTPClient             *http.Client
 	SemanticCacheThreshold float32
+	Tracer                 telemetry.TracerProvider
 }
 
 // NewHandlers creates a Handlers instance with fully injected dependencies.
@@ -72,6 +77,14 @@ func NewHandlers(
 	}
 }
 
+// SetTracer assigns a TracerProvider and propagates it to Council if available.
+func (h *Handlers) SetTracer(t telemetry.TracerProvider) {
+	h.Tracer = t
+	if h.Council != nil {
+		h.Council.SetTracer(t)
+	}
+}
+
 // retrieveAllChunks retrieves every text chunk for a doc_id from the RAG service.
 func (h *Handlers) retrieveAllChunks(docID string) ([]string, error) {
 	reqBody := map[string]string{"doc_id": docID}
@@ -80,7 +93,17 @@ func (h *Handlers) retrieveAllChunks(docID string) ([]string, error) {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := h.HTTPClient.Post(h.RAGServiceURL+"/retrieve-all", "application/json", bytes.NewReader(jsonBody))
+	ctx := context.Background()
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", h.RAGServiceURL+"/retrieve-all", bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create retrieve-all request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if h.Tracer != nil {
+		h.Tracer.InjectHTTPHeaders(ctx, httpReq)
+	}
+
+	resp, err := h.HTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("retrieve-all request failed: %w", err)
 	}
@@ -125,6 +148,9 @@ func (h *Handlers) retrieveChunks(r *http.Request, req QueryRequest) ([]string, 
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if h.Tracer != nil {
+		h.Tracer.InjectHTTPHeaders(r.Context(), httpReq)
+	}
 	resp, err := h.HTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("retrieval request failed: %w", err)
@@ -154,25 +180,65 @@ func (h *Handlers) retrieveChunks(r *http.Request, req QueryRequest) ([]string, 
 
 // getEmbedding generates a vector embedding for the input text from the RAG service.
 func (h *Handlers) getEmbedding(ctx context.Context, text string) ([]float32, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var span trace.Span
+	if h.Tracer != nil {
+		ctx, span = h.Tracer.StartSpan(ctx, "rag.embed",
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(
+				attribute.String("http.method", "POST"),
+				attribute.String("http.url", h.RAGServiceURL+"/embed"),
+				attribute.String("rpc.system", "python_rag"),
+				attribute.Int("text.length", len(text)),
+			),
+		)
+		defer span.End()
+	}
+
 	reqBody := map[string]string{"text": text}
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", h.RAGServiceURL+"/embed", bytes.NewReader(jsonBody))
 	if err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if h.Tracer != nil {
+		h.Tracer.InjectHTTPHeaders(ctx, httpReq)
+	}
 	resp, err := h.HTTPClient.Do(httpReq)
 	if err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return nil, fmt.Errorf("embed request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if span != nil {
+		span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if span != nil {
+			span.SetStatus(codes.Error, fmt.Sprintf("status %d", resp.StatusCode))
+		}
 		return nil, fmt.Errorf("embed failed (status %d): %s", resp.StatusCode, string(body))
 	}
 
@@ -180,7 +246,15 @@ func (h *Handlers) getEmbedding(ctx context.Context, text string) ([]float32, er
 		Embedding []float32 `json:"embedding"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if span != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	if span != nil {
+		span.SetAttributes(attribute.Int("vector.dim", len(result.Embedding)))
+		span.SetStatus(codes.Ok, "")
 	}
 	return result.Embedding, nil
 }
@@ -269,7 +343,19 @@ func (h *Handlers) retrieveWebSearch(ctx context.Context, query string) ([]strin
 		return nil, fmt.Errorf("failed to marshal search request: %w", err)
 	}
 
-	resp, err := h.HTTPClient.Post(h.RAGServiceURL+"/search", "application/json", bytes.NewReader(jsonBody))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", h.RAGServiceURL+"/search", bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create search request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if h.Tracer != nil {
+		h.Tracer.InjectHTTPHeaders(ctx, httpReq)
+	}
+
+	resp, err := h.HTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("search request failed: %w", err)
 	}

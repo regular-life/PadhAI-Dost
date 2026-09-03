@@ -39,10 +39,25 @@ type Config struct {
 	RedisAddr      string
 	RedisPassword  string
 	RedisDB        int
+	CircuitBreakerFailureThreshold int
+	CircuitBreakerSuccessThreshold int
+	CircuitBreakerTimeout          time.Duration
 	JWTSecret      string
 	JWTExpiration  time.Duration
 	RateLimitRPS   int
 	RateLimitBurst int
+
+	DatabaseURL       string
+	DBHost            string
+	DBPort            string
+	DBUser            string
+	DBPassword        string
+	DBName            string
+	DBSSLMode         string
+	DBMaxOpenConns    int
+	DBMaxIdleConns    int
+	DBConnMaxLifetime time.Duration
+	DBConnMaxIdleTime time.Duration
 
 	OpenRouterAPIKey string
 	OpenRouterURL    string
@@ -84,10 +99,27 @@ type yamlSchema struct {
 	} `yaml:"rag"`
 
 	Redis struct {
-		Addr     string `yaml:"addr"`
-		Password string `yaml:"password"`
-		DB       int    `yaml:"db"`
+		Addr             string `yaml:"addr"`
+		Password         string `yaml:"password"`
+		DB               int    `yaml:"db"`
+		FailureThreshold int    `yaml:"circuit_breaker_failure_threshold"`
+		SuccessThreshold int    `yaml:"circuit_breaker_success_threshold"`
+		Timeout          string `yaml:"circuit_breaker_timeout"`
 	} `yaml:"redis"`
+
+	Database struct {
+		URL             string `yaml:"url"`
+		Host            string `yaml:"host"`
+		Port            string `yaml:"port"`
+		User            string `yaml:"user"`
+		Password        string `yaml:"password"`
+		DBName          string `yaml:"dbname"`
+		SSLMode         string `yaml:"sslmode"`
+		MaxOpenConns    int    `yaml:"max_open_conns"`
+		MaxIdleConns    int    `yaml:"max_idle_conns"`
+		ConnMaxLifetime string `yaml:"conn_max_lifetime"`
+		ConnMaxIdleTime string `yaml:"conn_max_idle_time"`
+	} `yaml:"database"`
 
 	Providers struct {
 		OpenRouterURL string `yaml:"openrouter_url"`
@@ -199,6 +231,58 @@ func Load() *Config {
 	}
 	redisPwd := getEnv("REDIS_PASSWORD", y.Redis.Password)
 	redisDB := getEnvInt("REDIS_DB", y.Redis.DB)
+
+	cbFailureThresh := getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", y.Redis.FailureThreshold)
+	if cbFailureThresh <= 0 {
+		cbFailureThresh = 3
+	}
+	cbSuccessThresh := getEnvInt("CIRCUIT_BREAKER_SUCCESS_THRESHOLD", y.Redis.SuccessThreshold)
+	if cbSuccessThresh <= 0 {
+		cbSuccessThresh = 2
+	}
+	cbTimeout := parseDuration(getEnv("CIRCUIT_BREAKER_TIMEOUT", y.Redis.Timeout), 10*time.Second)
+
+	// Database Settings
+	dbURL := getEnv("DATABASE_URL", y.Database.URL)
+	dbHost := getEnv("DB_HOST", y.Database.Host)
+	dbPort := getEnv("DB_PORT", y.Database.Port)
+	if dbPort == "" {
+		dbPort = "5432"
+	}
+	dbUser := getEnv("DB_USER", y.Database.User)
+	if dbUser == "" {
+		dbUser = "council_user"
+	}
+	dbPass := getEnv("DB_PASSWORD", y.Database.Password)
+	if dbPass == "" {
+		dbPass = "council_pass"
+	}
+	dbName := getEnv("DB_NAME", y.Database.DBName)
+	if dbName == "" {
+		dbName = "council_db"
+	}
+	dbSSLMode := getEnv("DB_SSLMODE", y.Database.SSLMode)
+	if dbSSLMode == "" {
+		dbSSLMode = "disable"
+	}
+
+	if dbURL == "" && (dbHost != "" || os.Getenv("DB_HOST") != "") {
+		if dbHost == "" {
+			dbHost = "localhost"
+		}
+		dbURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", dbUser, dbPass, dbHost, dbPort, dbName, dbSSLMode)
+	}
+
+	maxOpenConns := getEnvInt("DB_MAX_OPEN_CONNS", y.Database.MaxOpenConns)
+	if maxOpenConns <= 0 {
+		maxOpenConns = 25
+	}
+	maxIdleConns := getEnvInt("DB_MAX_IDLE_CONNS", y.Database.MaxIdleConns)
+	if maxIdleConns <= 0 {
+		maxIdleConns = 5
+	}
+	connMaxLifetime := parseDuration(getEnv("DB_CONN_MAX_LIFETIME", y.Database.ConnMaxLifetime), 1*time.Hour)
+	connMaxIdleTime := parseDuration(getEnv("DB_CONN_MAX_IDLE_TIME", y.Database.ConnMaxIdleTime), 30*time.Minute)
 
 	// 3. Provider URLs & API Keys.
 	orURL := getEnv("OPENROUTER_URL", y.Providers.OpenRouterURL)
@@ -323,10 +407,25 @@ func Load() *Config {
 		RedisAddr:      redisAddr,
 		RedisPassword:  redisPwd,
 		RedisDB:        redisDB,
+		CircuitBreakerFailureThreshold: cbFailureThresh,
+		CircuitBreakerSuccessThreshold: cbSuccessThresh,
+		CircuitBreakerTimeout:          cbTimeout,
 		JWTSecret:      jwtSecret,
 		JWTExpiration:  jwtExp,
 		RateLimitRPS:   rps,
 		RateLimitBurst: burst,
+
+		DatabaseURL:       dbURL,
+		DBHost:            dbHost,
+		DBPort:            dbPort,
+		DBUser:            dbUser,
+		DBPassword:        dbPass,
+		DBName:            dbName,
+		DBSSLMode:         dbSSLMode,
+		DBMaxOpenConns:    maxOpenConns,
+		DBMaxIdleConns:    maxIdleConns,
+		DBConnMaxLifetime: connMaxLifetime,
+		DBConnMaxIdleTime: connMaxIdleTime,
 
 		OpenRouterAPIKey: orKey,
 		OpenRouterURL:    orURL,

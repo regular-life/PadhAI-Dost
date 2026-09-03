@@ -1,4 +1,27 @@
 services:
+  # ── PostgreSQL User Database ─────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: councilai-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-council_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-council_pass}
+      - POSTGRES_DB=${POSTGRES_DB:-council_db}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-council_user} -d ${POSTGRES_DB:-council_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - councilai-net
+
   # ── Go Control Plane ─────────────────────────────────────────────────
   go-backend:
     build:
@@ -7,6 +30,7 @@ services:
     ports:
       - "8080:8080"
     environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER:-council_user}:${POSTGRES_PASSWORD:-council_pass}@postgres:5432/${POSTGRES_DB:-council_db}?sslmode=disable
       - MOCK_LLM=${MOCK_LLM:-false}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -14,6 +38,8 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       python-rag:
@@ -45,7 +71,7 @@ services:
   # ── Redis (Persistent Stack Server) ──────────────────────────────────
   redis:
     image: redis/redis-stack-server:latest
-    command: ["redis-stack-server", "--save", "60", "1", "--appendonly", "yes", "--dir", "/data"]
+    command: ["redis-stack-server", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru", "--save", ""]
     ports:
       - "6379:6379"
     volumes:
@@ -125,6 +151,7 @@ services:
 volumes:
   chroma-data:
   redis-data:
+  postgres-data:
   prometheus-data:
   grafana-data:
   vllm-models:

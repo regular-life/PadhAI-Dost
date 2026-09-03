@@ -2,10 +2,18 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/regular-life/CouncilAI/go-backend/internal/agent"
+	"github.com/regular-life/CouncilAI/go-backend/internal/council"
+	"github.com/regular-life/CouncilAI/go-backend/internal/llm"
 )
 
 func TestJSONResponse(t *testing.T) {
@@ -613,5 +621,571 @@ func TestExhaustiveHTTPMatrix(t *testing.T) {
 		}
 	})
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone 1 SSE Streaming & Content Negotiation Test Doubles & Suites
+// ─────────────────────────────────────────────────────────────────────────────
+
+type handlerMockLLMClient struct {
+	Name             string
+	Delay            time.Duration
+	Fail             bool
+	GenerateFunc     func(ctx context.Context, prompt string) (*llm.Response, error)
+	GenerateChatFunc func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error)
+}
+
+func (m *handlerMockLLMClient) ModelName() string {
+	if m.Name != "" {
+		return m.Name
+	}
+	return "mock:test-model"
+}
+
+func (m *handlerMockLLMClient) Generate(ctx context.Context, prompt string) (*llm.Response, error) {
+	if m.Delay > 0 {
+		select {
+		case <-time.After(m.Delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if m.Fail {
+		return nil, context.DeadlineExceeded
+	}
+	if m.GenerateFunc != nil {
+		return m.GenerateFunc(ctx, prompt)
+	}
+	return &llm.Response{
+		Answer:     "RANKING: A, B\nREASONING: Model A is concise and accurate",
+		Model:      m.ModelName(),
+		Confidence: 0.9,
+	}, nil
+}
+
+func (m *handlerMockLLMClient) GenerateChat(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+	if m.Delay > 0 {
+		select {
+		case <-time.After(m.Delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if m.Fail {
+		return nil, context.DeadlineExceeded
+	}
+	if m.GenerateChatFunc != nil {
+		return m.GenerateChatFunc(ctx, opts)
+	}
+	return &llm.Response{
+		Answer:     "Candidate draft from " + m.ModelName(),
+		Model:      m.ModelName(),
+		Confidence: 0.9,
+	}, nil
+}
+
+type ParsedSSEEvent struct {
+	Event string
+	Data  string
+}
+
+func parseSSEEvents(raw string) []ParsedSSEEvent {
+	var events []ParsedSSEEvent
+	blocks := strings.Split(raw, "\n\n")
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var evt ParsedSSEEvent
+		lines := strings.Split(block, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "event:") {
+				evt.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			} else if strings.HasPrefix(line, "data:") {
+				evt.Data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			}
+		}
+		if evt.Event != "" || evt.Data != "" {
+			events = append(events, evt)
+		}
+	}
+	return events
+}
+
+type StreamingRecorder struct {
+	*httptest.ResponseRecorder
+	FlushChan chan struct{}
+}
+
+func NewStreamingRecorder() *StreamingRecorder {
+	return &StreamingRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		FlushChan:        make(chan struct{}, 100),
+	}
+}
+
+func (r *StreamingRecorder) Flush() {
+	r.ResponseRecorder.Flush()
+	select {
+	case r.FlushChan <- struct{}{}:
+	default:
+	}
+}
+
+type nonFlusherResponseWriter struct {
+	header     http.Header
+	body       *bytes.Buffer
+	statusCode int
+}
+
+func newNonFlusherResponseWriter() *nonFlusherResponseWriter {
+	return &nonFlusherResponseWriter{
+		header:     make(http.Header),
+		body:       new(bytes.Buffer),
+		statusCode: http.StatusOK,
+	}
+}
+
+func (n *nonFlusherResponseWriter) Header() http.Header {
+	return n.header
+}
+
+func (n *nonFlusherResponseWriter) Write(b []byte) (int, error) {
+	return n.body.Write(b)
+}
+
+func (n *nonFlusherResponseWriter) WriteHeader(code int) {
+	n.statusCode = code
+}
+
+func setupTestHandlersWithCouncil(t *testing.T, clients []llm.LLMClient, chairman llm.LLMClient) *Handlers {
+	t.Helper()
+	orch := council.NewOrchestrator(clients, chairman, 5*time.Second)
+	return &Handlers{
+		Council: orch,
+	}
+}
+
+func TestHandleQuery_SSE_Headers(t *testing.T) {
+	os.Setenv("MOCK_LLM", "true")
+	defer os.Unsetenv("MOCK_LLM")
+
+	h := setupTestHandlersWithCouncil(t, nil, nil)
+
+	cases := []struct {
+		name         string
+		acceptHeader string
+	}{
+		{"Standard SSE Accept", "text/event-stream"},
+		{"Case Insensitive Accept", "TEXT/EVENT-STREAM"},
+		{"Accept with Charset Param", "text/event-stream; charset=utf-8"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqBody := `{"question": "What are the architectural trade-offs of CouncilAI?"}`
+			req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", tc.acceptHeader)
+
+			w := httptest.NewRecorder()
+			h.HandleQuery(w, req)
+
+			res := w.Result()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("expected status 200, got %d", res.StatusCode)
+			}
+
+			expectedHeaders := map[string]string{
+				"Content-Type":      "text/event-stream; charset=utf-8",
+				"Cache-Control":     "no-cache",
+				"Connection":        "keep-alive",
+				"X-Accel-Buffering": "no",
+			}
+
+			for key, expectedVal := range expectedHeaders {
+				got := res.Header.Get(key)
+				if got != expectedVal {
+					t.Errorf("header %s: expected %q, got %q", key, expectedVal, got)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleQuery_SSE_FullDeliberationSequence(t *testing.T) {
+	mockClients := []llm.LLMClient{
+		&handlerMockLLMClient{
+			Name: "openrouter:anthropic/claude-3.5-sonnet",
+			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+				return &llm.Response{Answer: "Draft from Claude", Model: "openrouter:anthropic/claude-3.5-sonnet"}, nil
+			},
+			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+				return &llm.Response{Answer: "RANKING: A, B\nREASONING: Claude is comprehensive", Model: "openrouter:anthropic/claude-3.5-sonnet"}, nil
+			},
+		},
+		&handlerMockLLMClient{
+			Name: "openrouter:openai/gpt-4o",
+			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+				return &llm.Response{Answer: "Draft from GPT-4o", Model: "openrouter:openai/gpt-4o"}, nil
+			},
+			GenerateFunc: func(ctx context.Context, prompt string) (*llm.Response, error) {
+				return &llm.Response{Answer: "RANKING: B, A\nREASONING: GPT-4o has better structure", Model: "openrouter:openai/gpt-4o"}, nil
+			},
+		},
+	}
+	mockChairman := &handlerMockLLMClient{
+		Name: "chairman:gemini-2.0-flash",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{
+				Answer: `{"answer":"Final consensus answer","confidence":0.95,"source":"chairman:gemini-2.0-flash","reasoning":"Synthesized from Claude and GPT-4o"}`,
+				Model:  "chairman:gemini-2.0-flash",
+			}, nil
+		},
+	}
+
+	h := setupTestHandlersWithCouncil(t, mockClients, mockChairman)
+
+	reqBody := `{"question": "Explain multi-agent deliberation trade-offs"}`
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(reqBody))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := httptest.NewRecorder()
+	h.HandleQuery(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	if len(events) < 5 {
+		t.Fatalf("expected at least 5 SSE events (2 candidate_draft + 2 peer_review + 1 final_answer), got %d: %s", len(events), w.Body.String())
+	}
+
+	candidateCount := 0
+	peerReviewCount := 0
+	finalAnswerFound := false
+
+	for _, evt := range events {
+		switch evt.Event {
+		case "candidate_draft":
+			candidateCount++
+			var data map[string]interface{}
+			if err := json.Unmarshal([]byte(evt.Data), &data); err != nil {
+				t.Errorf("candidate_draft data failed to unmarshal: %v", err)
+			}
+			if data["model"] == nil || data["answer"] == nil {
+				t.Errorf("candidate_draft missing model or answer: %v", data)
+			}
+			if data["model_name"] == nil || data["content"] == nil {
+				t.Errorf("candidate_draft missing compatibility aliases: %v", data)
+			}
+		case "peer_review":
+			peerReviewCount++
+			var data map[string]interface{}
+			if err := json.Unmarshal([]byte(evt.Data), &data); err != nil {
+				t.Errorf("peer_review data failed to unmarshal: %v", err)
+			}
+			if data["reviewer"] == nil || data["review"] == nil {
+				t.Errorf("peer_review missing reviewer or review: %v", data)
+			}
+		case "final_answer":
+			finalAnswerFound = true
+			var data QueryResponse
+			if err := json.Unmarshal([]byte(evt.Data), &data); err != nil {
+				t.Errorf("final_answer data failed to unmarshal QueryResponse: %v", err)
+			}
+			if data.Answer != "Final consensus answer" {
+				t.Errorf("expected 'Final consensus answer', got %q", data.Answer)
+			}
+			if data.Confidence != 0.95 {
+				t.Errorf("expected confidence 0.95, got %f", data.Confidence)
+			}
+		}
+	}
+
+	if candidateCount != 2 {
+		t.Errorf("expected 2 candidate_draft events, got %d", candidateCount)
+	}
+	if peerReviewCount != 2 {
+		t.Errorf("expected 2 peer_review events, got %d", peerReviewCount)
+	}
+	if !finalAnswerFound {
+		t.Errorf("final_answer event was not emitted")
+	}
+}
+
+func TestHandleQuery_SSE_TTFT_Under1500ms(t *testing.T) {
+	mockClients := []llm.LLMClient{
+		&handlerMockLLMClient{
+			Name:  "mock:fast-model",
+			Delay: 5 * time.Millisecond,
+			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+				return &llm.Response{Answer: "Fast draft", Model: "mock:fast-model"}, nil
+			},
+		},
+		&handlerMockLLMClient{
+			Name:  "mock:slow-model",
+			Delay: 30 * time.Millisecond,
+			GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+				return &llm.Response{Answer: "Slow draft", Model: "mock:slow-model"}, nil
+			},
+		},
+	}
+	mockChairman := &handlerMockLLMClient{
+		Name: "mock:chairman",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{
+				Answer: `{"answer":"Final synthesized answer"}`,
+				Model:  "mock:chairman",
+			}, nil
+		},
+	}
+
+	h := setupTestHandlersWithCouncil(t, mockClients, mockChairman)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "test TTFT"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := NewStreamingRecorder()
+
+	start := time.Now()
+	go h.HandleQuery(w, req)
+
+	// First flush is the stream header (status 200 OK)
+	select {
+	case <-w.FlushChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for header flush")
+	}
+
+	// Second flush is the first candidate_draft frame
+	select {
+	case <-w.FlushChan:
+		ttft := time.Since(start)
+		if ttft > 1500*time.Millisecond {
+			t.Errorf("TTFT exceeded 1.5s threshold: took %v", ttft)
+		}
+		events := parseSSEEvents(w.Body.String())
+		if len(events) == 0 || events[0].Event != "candidate_draft" {
+			t.Errorf("expected first flushed event to be candidate_draft, got: %s", w.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first candidate_draft event")
+	}
+}
+
+func TestHandleQuery_JSON_BackwardCompatibility(t *testing.T) {
+	os.Setenv("MOCK_LLM", "true")
+	defer os.Unsetenv("MOCK_LLM")
+
+	h := setupTestHandlersWithCouncil(t, nil, nil)
+
+	cases := []struct {
+		name         string
+		acceptHeader string
+	}{
+		{"Explicit JSON Accept", "application/json"},
+		{"Omitted Accept Header", ""},
+		{"Wildcard Accept Header", "*/*"},
+		{"Quality Weighted JSON Accept", "application/json;q=0.9, text/plain;q=0.8"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "What is CouncilAI?"}`))
+			if tc.acceptHeader != "" {
+				req.Header.Set("Accept", tc.acceptHeader)
+			}
+
+			w := httptest.NewRecorder()
+			h.HandleQuery(w, req)
+
+			res := w.Result()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("expected status 200, got %d", res.StatusCode)
+			}
+
+			ct := res.Header.Get("Content-Type")
+			if !strings.HasPrefix(ct, "application/json") {
+				t.Errorf("expected Content-Type application/json, got %q", ct)
+			}
+
+			body := w.Body.String()
+			if strings.HasPrefix(body, "event:") || strings.Contains(body, "data:") {
+				t.Errorf("response body contained SSE frames instead of clean JSON: %s", body)
+			}
+
+			var resp QueryResponse
+			if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+				t.Fatalf("failed to decode JSON response: %v", err)
+			}
+			if resp.Answer == "" {
+				t.Errorf("expected non-empty answer in QueryResponse")
+			}
+		})
+	}
+}
+
+func TestHandleQuery_ValidationErrors(t *testing.T) {
+	h := setupTestHandlersWithCouncil(t, nil, nil)
+
+	cases := []struct {
+		name         string
+		body         string
+		acceptHeader string
+		expectedCode int
+		expectedErr  string
+	}{
+		{
+			name:         "Empty Question with SSE Accept",
+			body:         `{"question": ""}`,
+			acceptHeader: "text/event-stream",
+			expectedCode: http.StatusBadRequest,
+			expectedErr:  "question is required",
+		},
+		{
+			name:         "Oversized Question with SSE Accept",
+			body:         `{"question": "` + strings.Repeat("a", 10001) + `"}`,
+			acceptHeader: "text/event-stream",
+			expectedCode: http.StatusBadRequest,
+			expectedErr:  "question exceeds maximum allowed length of 10000 characters",
+		},
+		{
+			name:         "Malformed JSON with SSE Accept",
+			body:         `{invalid_json}`,
+			acceptHeader: "text/event-stream",
+			expectedCode: http.StatusBadRequest,
+			expectedErr:  "invalid request body",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(tc.body))
+			req.Header.Set("Accept", tc.acceptHeader)
+
+			w := httptest.NewRecorder()
+			h.HandleQuery(w, req)
+
+			res := w.Result()
+			if res.StatusCode != tc.expectedCode {
+				t.Errorf("expected status %d, got %d", tc.expectedCode, res.StatusCode)
+			}
+			if ct := res.Header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("expected Content-Type application/json for validation errors, got %s", ct)
+			}
+
+			var resp map[string]string
+			if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+				t.Fatalf("failed to decode error body: %v", err)
+			}
+			if resp["error"] != tc.expectedErr {
+				t.Errorf("expected error %q, got %q", tc.expectedErr, resp["error"])
+			}
+		})
+	}
+}
+
+func TestHandleQuery_DirectStrategy(t *testing.T) {
+	mockChairman := &handlerMockLLMClient{
+		Name: "mock:direct-model",
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{
+				Answer: "Direct response from model",
+				Model:  "mock:direct-model",
+			}, nil
+		},
+	}
+
+	h := setupTestHandlersWithCouncil(t, nil, mockChairman)
+	mockRouterClient := &handlerMockLLMClient{
+		GenerateChatFunc: func(ctx context.Context, opts llm.GenerateOptions) (*llm.Response, error) {
+			return &llm.Response{
+				Answer: `{"strategy":"direct","reasoning":"simple question","needs_doc":false}`,
+			}, nil
+		},
+	}
+	h.Router = agent.NewRouter(mockRouterClient)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Direct question"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := httptest.NewRecorder()
+	h.HandleQuery(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	if len(events) == 0 {
+		t.Fatalf("expected SSE events for direct query")
+	}
+
+	var foundDraft, foundFinal bool
+	for _, ev := range events {
+		if ev.Event == "candidate_draft" {
+			foundDraft = true
+		}
+		if ev.Event == "final_answer" {
+			foundFinal = true
+		}
+	}
+	if !foundDraft {
+		t.Errorf("expected candidate_draft event in direct strategy stream")
+	}
+	if !foundFinal {
+		t.Errorf("expected final_answer event in direct strategy stream")
+	}
+}
+
+func TestHandleQuery_AllCandidatesFail(t *testing.T) {
+	mockClients := []llm.LLMClient{
+		&handlerMockLLMClient{Name: "mock:fail-1", Fail: true},
+		&handlerMockLLMClient{Name: "mock:fail-2", Fail: true},
+	}
+
+	h := setupTestHandlersWithCouncil(t, mockClients, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Will fail"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := httptest.NewRecorder()
+	h.HandleQuery(w, req)
+
+	events := parseSSEEvents(w.Body.String())
+	var foundError bool
+	for _, ev := range events {
+		if ev.Event == "error" {
+			foundError = true
+			var errPayload map[string]interface{}
+			if err := json.Unmarshal([]byte(ev.Data), &errPayload); err != nil {
+				t.Errorf("failed to unmarshal error payload: %v", err)
+			}
+			if errPayload["message"] == nil && errPayload["error"] == nil {
+				t.Errorf("expected error or message field in error payload: %v", errPayload)
+			}
+		}
+	}
+	if !foundError {
+		t.Errorf("expected error event when all candidates fail: %s", w.Body.String())
+	}
+}
+
+func TestHandleQuery_NonFlusherError(t *testing.T) {
+	h := setupTestHandlersWithCouncil(t, nil, nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"question": "Non flusher"}`))
+	req.Header.Set("Accept", "text/event-stream")
+
+	w := newNonFlusherResponseWriter()
+	h.HandleQuery(w, req)
+
+	if w.statusCode != http.StatusInternalServerError {
+		t.Errorf("expected status 500 when flusher unsupported, got %d", w.statusCode)
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if resp["error"] != "streaming unsupported" {
+		t.Errorf("expected 'streaming unsupported', got %q", resp["error"])
+	}
+}
+
 
 

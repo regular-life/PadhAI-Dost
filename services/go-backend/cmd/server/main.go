@@ -20,6 +20,7 @@ import (
 	"github.com/regular-life/CouncilAI/go-backend/internal/council"
 	"github.com/regular-life/CouncilAI/go-backend/internal/llm"
 	"github.com/regular-life/CouncilAI/go-backend/internal/memory"
+	"github.com/regular-life/CouncilAI/go-backend/internal/telemetry"
 )
 
 func main() {
@@ -29,8 +30,21 @@ func main() {
 
 	// ── Core infrastructure ─────────────────────────────────────────
 	jwtManager := auth.NewJWTManager(cfg.JWTSecret, cfg.JWTExpiration)
+
+	// Shared Redis Circuit Breaker for unified failure detection across L1 and L2
+	cbConfig := cache.Config{
+		FailureThreshold: cfg.CircuitBreakerFailureThreshold,
+		SuccessThreshold: cfg.CircuitBreakerSuccessThreshold,
+		Timeout:          cfg.CircuitBreakerTimeout,
+		HalfOpenMaxCalls: 1,
+	}
+	redisCB := cache.NewCircuitBreaker("shared-redis-breaker", cbConfig)
+
 	redisCache := cache.NewRedisCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	redisCache.SetCircuitBreaker(redisCB)
+
 	semCache := cache.NewRedisSemanticCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	semCache.SetCircuitBreaker(redisCB)
 	if err := semCache.EnsureIndex(context.Background()); err != nil {
 		log.Printf("[Warning] Failed to ensure RediSearch index: %v", err)
 	}
@@ -100,8 +114,78 @@ func main() {
 	}
 	ingestAgent := agent.NewIngestAgent(ingestClient)
 
+	// ── User Repository (PostgreSQL with Memory Fallback) ─────────────
+	var userRepo auth.UserRepository
+	pgConfig := auth.PostgresConfig{
+		URL:             cfg.DatabaseURL,
+		Host:            cfg.DBHost,
+		Port:            cfg.DBPort,
+		User:            cfg.DBUser,
+		Password:        cfg.DBPassword,
+		Database:        cfg.DBName,
+		SSLMode:         cfg.DBSSLMode,
+		MaxConns:        int32(cfg.DBMaxOpenConns),
+		MinConns:        int32(cfg.DBMaxIdleConns),
+		MaxConnLifetime: cfg.DBConnMaxLifetime,
+		MaxConnIdleTime: cfg.DBConnMaxIdleTime,
+	}
+
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pgRepo, err := auth.NewPostgresUserRepository(dbCtx, pgConfig)
+	dbCancel()
+
+	if err != nil {
+		log.Printf("[Warning] PostgreSQL initialization failed: %v. Falling back to MemoryUserRepository", err)
+		memRepo := auth.NewMemoryUserRepository()
+		_ = memRepo.SeedDemoUser(context.Background(), "demo", "demo123")
+		userRepo = memRepo
+	} else {
+		log.Println("Connected to PostgreSQL successfully")
+		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := pgRepo.InitSchema(initCtx); err != nil {
+			log.Fatalf("Failed to initialize PostgreSQL schema: %v", err)
+		}
+		if err := pgRepo.SeedDemoUser(initCtx, "demo", "demo123"); err != nil {
+			log.Printf("[Warning] Failed to seed demo user: %v", err)
+		}
+		initCancel()
+		userRepo = pgRepo
+	}
+	defer userRepo.Close()
+
+	// ── OpenTelemetry Tracing ───────────────────────────────────────
+	env := os.Getenv("ENVIRONMENT")
+	if env == "" {
+		if cfg.Debug {
+			env = "development"
+		} else {
+			env = "production"
+		}
+	}
+	tracer, err := telemetry.NewTracerProvider(telemetry.Config{
+		ServiceName:    "councilai-go-backend",
+		ServiceVersion: "2.0.0",
+		Environment:    env,
+		ExporterType:   telemetry.ExporterNoop,
+	})
+	if err != nil {
+		log.Printf("[Warning] Failed to initialize OpenTelemetry tracer: %v", err)
+	} else {
+		log.Println("OpenTelemetry distributed tracing initialized successfully")
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := tracer.Shutdown(shutdownCtx); err != nil {
+				log.Printf("[Telemetry] Shutdown error: %v", err)
+			}
+		}()
+	}
+
 	// ── Wire everything together ────────────────────────────────────
 	councilOrchestrator := council.NewOrchestrator(councilClients, chairmanClient, cfg.StageTimeout)
+	if tracer != nil {
+		councilOrchestrator.SetTracer(tracer)
+	}
 
 	h := handlers.NewHandlers(
 		cfg.RAGServiceURL,
@@ -114,7 +198,10 @@ func main() {
 		convStore,
 		float32(cfg.SemanticCacheThreshold),
 	)
-	authHandler := handlers.NewAuthHandler(jwtManager)
+	if tracer != nil {
+		h.SetTracer(tracer)
+	}
+	authHandler := handlers.NewAuthHandler(jwtManager, userRepo)
 	router := api.NewRouter(cfg, h, authHandler, jwtManager)
 
 	// ── HTTP server ─────────────────────────────────────────────────
@@ -140,6 +227,7 @@ func main() {
 		}
 		redisCache.Close()
 		convStore.Close()
+		userRepo.Close()
 		log.Println("Server stopped")
 	}()
 

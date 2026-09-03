@@ -81,7 +81,15 @@ Upload a document (PDF) for parsing, OCR routing, layout-aware chunking, and vec
 
 ### `POST /api/v1/query`
 Ask a question. If `doc_id` is provided, the answer is grounded in the document context. If `doc_id` is omitted, the query defaults to general knowledge with DuckDuckGo real-time Web Search grounding.
+
+Supports both **Server-Sent Events (SSE) Streaming** and standard **Synchronous JSON** responses via HTTP content negotiation (`Accept` header).
+
 * **Auth Required:** Yes
+* **Headers:**
+  * `Authorization: Bearer <token>` (Required)
+  * `Content-Type: application/json` (Required)
+  * `Accept: text/event-stream` (Optional, activates real-time SSE streaming)
+  * `Accept: application/json` (Optional / default, returns monolithic JSON response)
 * **Body:**
   ```json
   {
@@ -92,6 +100,56 @@ Ask a question. If `doc_id` is provided, the answer is grounded in the document 
   }
   ```
   * Note: `doc_id` (optional), `top_k` (optional integer, default `5`), `session_id` (optional string).
+
+#### Mode 1: Server-Sent Events (SSE) Streaming (`Accept: text/event-stream`)
+
+When `Accept: text/event-stream` is requested, the server immediately flushes HTTP 200 headers and progressively streams deliberation lifecycle frames.
+
+* **Response Headers:**
+  * `Content-Type: text/event-stream; charset=utf-8`
+  * `Cache-Control: no-cache`
+  * `Connection: keep-alive`
+  * `X-Accel-Buffering: no`
+* **cURL Example:**
+  ```bash
+  curl -N http://localhost:8080/api/v1/query \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -H "Accept: text/event-stream" \
+    -d '{"question":"What are the core architectural trade-offs?","doc_id":"your_doc_id"}'
+  ```
+* **Event Frames Lifecycle:**
+
+1. **`event: candidate_draft`** (Stage 1 Fan-Out, emitted asynchronously per model with TTFT < 1.5s):
+   ```http
+   event: candidate_draft
+   data: {"index":0,"model":"openrouter:anthropic/claude-3.5-sonnet","model_name":"openrouter:anthropic/claude-3.5-sonnet","answer":"Draft candidate response text...","content":"Draft candidate response text...","latency_ms":450}
+
+   ```
+
+2. **`event: peer_review`** (Stage 2 Peer Review, emitted asynchronously per reviewer):
+   ```http
+   event: peer_review
+   data: {"index":0,"reviewer":"openrouter:openai/gpt-4o","review":"RANKING: A, B\nREASONING: Response A provides superior depth...","critique":"Response A provides superior depth...","ranking":["A","B"],"scores":{"A":2,"B":1},"latency_ms":520}
+
+   ```
+
+3. **`event: final_answer`** (Stage 3 Chairman Consensus / Cache Hit):
+   ```http
+   event: final_answer
+   data: {"answer":"The core architectural trade-offs involve Redis Stack RediSearch VSS...","confidence":0.95,"source":"chairman:gemini-2.0-flash","strategy":"council","reasoning":"Synthesized from Claude and GPT-4o with peer review weighting.","peer_reviewed":true,"reflection":null,"candidates":[{"model":"openrouter:anthropic/claude-3.5-sonnet","answer":"..."},{"model":"openrouter:openai/gpt-4o","answer":"..."}],"latency":"1.120s","cache_hit":false}
+
+   ```
+
+4. **`event: error`** (Fatal error during stream):
+   ```http
+   event: error
+   data: {"code":500,"message":"LLM council failed","error":"all council members failed to respond"}
+
+   ```
+
+#### Mode 2: Synchronous JSON Response (`Accept: application/json` or omitted)
+
 * **cURL Example:**
   ```bash
   curl http://localhost:8080/api/v1/query \
@@ -99,7 +157,7 @@ Ask a question. If `doc_id` is provided, the answer is grounded in the document 
     -H "Content-Type: application/json" \
     -d '{"question":"What are the core architectural trade-offs?","doc_id":"your_doc_id"}'
   ```
-* **Response (200 OK):**
+* **Response (200 OK, `Content-Type: application/json`):**
   ```json
   {
     "answer": "The core architectural trade-offs involve Redis Stack RediSearch VSS for vector similarity caching...",
